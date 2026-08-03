@@ -301,6 +301,46 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// --- Shared, pool-capped whatsmeow sqlstore container (Postgres) ------------------------
+//
+// Root-cause fix for the connection-exhaustion outage: the old StartClient created a fresh
+// sqlstore.Container (and therefore a brand-new, UNBOUNDED *sql.DB pool) on every (re)connect
+// and never closed it. An instance stuck in a reconnect loop leaked one pool per attempt until
+// Postgres ran out of connections ("too many clients already") and ALL instances dropped.
+//
+// whatsmeow is designed for one Container to serve many devices, so we open ONE pool-capped
+// *sql.DB for the whole process, run migrations once, and reuse it everywhere. The pool cap is
+// a hard ceiling: no reconnect storm can ever exhaust Postgres again.
+var (
+	sharedPGContainer     *sqlstore.Container
+	sharedPGContainerErr  error
+	sharedPGContainerOnce sync.Once
+)
+
+func getSharedPGContainer(dsn string) (*sqlstore.Container, error) {
+	sharedPGContainerOnce.Do(func() {
+		db, err := sql.Open("postgres", dsn)
+		if err != nil {
+			sharedPGContainerErr = fmt.Errorf("failed to open shared postgres db: %w", err)
+			return
+		}
+		// Hard ceiling on connections so a reconnect storm can never exhaust Postgres.
+		db.SetMaxOpenConns(20)
+		db.SetMaxIdleConns(4)
+		db.SetConnMaxLifetime(30 * time.Minute)
+		db.SetConnMaxIdleTime(5 * time.Minute)
+
+		c := sqlstore.NewWithDB(db, "postgres", nil)
+		if upErr := c.Upgrade(context.Background()); upErr != nil {
+			_ = c.Close()
+			sharedPGContainerErr = fmt.Errorf("failed to upgrade shared postgres db: %w", upErr)
+			return
+		}
+		sharedPGContainer = c
+	})
+	return sharedPGContainer, sharedPGContainerErr
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
@@ -316,21 +356,18 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	var container *sqlstore.Container
 
-	if w.config.WaDebug != "" {
+	if w.config.PostgresAuthDB != "" {
+		// Postgres (production): reuse ONE shared, pool-capped container for every instance
+		// instead of opening a fresh unbounded pool per (re)connect (the old leak that
+		// exhausted Postgres and dropped all numbers). See getSharedPGContainer above.
+		container, err = getSharedPGContainer(w.config.PostgresAuthDB)
+	} else if w.config.WaDebug != "" {
 		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
-		}
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
 	} else {
-		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
-		} else {
-			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
-		}
+		dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
+		container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
 	}
 
 	if err != nil {

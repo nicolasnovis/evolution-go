@@ -1273,6 +1273,29 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}()
 		}
 
+		// N1 PATCH: decrypt edited-message text (secretEncryptedMessage / MESSAGE_EDIT).
+		// The new text of an edited message arrives encrypted in secretEncryptedMessage; whatsmeow
+		// only decrypts polls out of the box. Here we decrypt the edit and rewrap it as a
+		// ProtocolMessage/MESSAGE_EDIT so the classifier reports "edit" and the webhook carries
+		// protocolMessage.editedMessage (which Novi already consumes). Done BEFORE GetMessageType so
+		// the reclassification takes effect. Failure degrades to the old marker-only behaviour.
+		if enc := evt.Message.GetSecretEncryptedMessage(); enc != nil && enc.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
+			decrypted, err := mycli.clientPointer[mycli.userID].DecryptSecretEncryptedMessage(context.Background(), evt)
+			if err != nil {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt edited message: %v", mycli.userID, err)
+			} else {
+				// TEMP (remove after live validation): confirm the decrypted proto shape.
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Decrypted edited message: %+v", mycli.userID, decrypted)
+				evt.Message = &waE2E.Message{
+					ProtocolMessage: &waE2E.ProtocolMessage{
+						Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+						Key:           enc.GetTargetMessageKey(),
+						EditedMessage: decrypted,
+					},
+				}
+			}
+		}
+
 		parsedMessageType := utils.GetMessageType(evt.Message)
 		if parsedMessageType == "ignore" || strings.HasPrefix(parsedMessageType, "unknown_protocol_") {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Message ignored because it's a unknown protocol message", mycli.userID)

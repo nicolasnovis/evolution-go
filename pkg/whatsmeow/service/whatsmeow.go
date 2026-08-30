@@ -1234,8 +1234,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			if err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt edited message: %v", mycli.userID, err)
 			} else {
-				// TEMP (remove after live validation): confirm the decrypted proto shape.
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Decrypted edited message: %+v", mycli.userID, decrypted)
 				// DecryptSecretEncryptedMessage returns a FULL Message already wrapped as
 				// ProtocolMessage/MESSAGE_EDIT/EditedMessage. Unwrap one level so we don't double-wrap
 				// (which buries the text and Novi's extractContent finds nothing). Keep the fork's

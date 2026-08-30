@@ -1236,12 +1236,19 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			} else {
 				// TEMP (remove after live validation): confirm the decrypted proto shape.
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Decrypted edited message: %+v", mycli.userID, decrypted)
-				evt.Message = &waE2E.Message{
-					ProtocolMessage: &waE2E.ProtocolMessage{
-						Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
-						Key:           enc.GetTargetMessageKey(),
-						EditedMessage: decrypted,
-					},
+				// DecryptSecretEncryptedMessage returns a FULL Message already wrapped as
+				// ProtocolMessage/MESSAGE_EDIT/EditedMessage. Unwrap one level so we don't double-wrap
+				// (which buries the text and Novi's extractContent finds nothing). Keep the fork's
+				// external targetMessageKey — that's the ID Novi matches against in the DB. The nil
+				// guard leaves evt.Message untouched on an unexpected shape → safe marker-only fallback.
+				if inner := decrypted.GetProtocolMessage().GetEditedMessage(); inner != nil {
+					evt.Message = &waE2E.Message{
+						ProtocolMessage: &waE2E.ProtocolMessage{
+							Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+							Key:           enc.GetTargetMessageKey(),
+							EditedMessage: inner,
+						},
+					}
 				}
 			}
 		}

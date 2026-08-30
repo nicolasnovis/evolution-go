@@ -2011,6 +2011,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "CallRelayLatency"
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Got call relay latency %+v", mycli.userID, evt)
+	case *events.OfflineSyncPreview:
+		// N1 PATCH: emit the offline-queue preview so catch-up is auditable (Total expected).
+		doWebhook = true
+		postMap["event"] = "OfflineSyncPreview"
 	case *events.OfflineSyncCompleted:
 		doWebhook = true
 		postMap["event"] = "OfflineSyncCompleted"
@@ -2271,6 +2275,13 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
 	case "HistorySync":
+		if contains(subscriptions, "HISTORY_SYNC") {
+			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
+			w.sendToQueueOrWebhook(instance, queueName, jsonData)
+		}
+	case "OfflineSyncPreview", "OfflineSyncCompleted":
+		// N1 PATCH: without this case both fall through to default:return and never dispatch.
+		// Reuse HISTORY_SYNC so Novi (already subscribed) receives them with zero subscribe change.
 		if contains(subscriptions, "HISTORY_SYNC") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)

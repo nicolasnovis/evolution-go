@@ -1864,6 +1864,16 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Message delivered to %s", mycli.userID, evt.SourceString())
+		} else if evt.Type == types.ReceiptTypePlayed || evt.Type == types.ReceiptTypePlayedSelf {
+			// N1 PATCH: recibo de áudio TOCADO. Sem este ramo, o else final descartava o evento e o
+			// webhook nunca era enviado. "Played" = o CONTATO ouviu um áudio NOSSO (vira ✓✓ azul no
+			// CRM). "PlayedSelf" = EU ouvi um áudio recebido em OUTRO aparelho meu (celular/web) → o
+			// Novi marca o áudio como escutado (▶ ouvido fica global entre WhatsApp e CRM).
+			if evt.Type == types.ReceiptTypePlayed {
+				postMap["state"] = "Played"
+			} else {
+				postMap["state"] = "PlayedSelf"
+			}
 		} else {
 			return
 		}

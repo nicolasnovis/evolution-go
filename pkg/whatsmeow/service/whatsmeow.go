@@ -1356,6 +1356,36 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 				}
 
+				// NOVI: emite webhook do VOTO pro CRM (o upstream só salvava no banco). O CRM conhece
+				// as opções que mandou (question com as_poll), então casa o hash SHA-256 → opção e
+				// retoma o fluxo. Best-effort, espelha o evento ButtonClick. NÃO bloqueia o save abaixo.
+				selectedHex := make([]string, 0, len(decrypted.SelectedOptions))
+				for _, option := range decrypted.SelectedOptions {
+					selectedHex = append(selectedHex, fmt.Sprintf("%X", option))
+				}
+				voterJid := evt.Info.Sender.String()
+				if strings.HasSuffix(voterJid, "@lid") && strings.HasSuffix(evt.Info.SenderAlt.String(), "@s.whatsapp.net") {
+					voterJid = evt.Info.SenderAlt.String()
+				}
+				pollVoteMap := map[string]interface{}{
+					"event": "PollVote",
+					"from":  voterJid,
+					"data": map[string]interface{}{
+						"pollMessageId":   evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetID(),
+						"chat":            evt.Info.Chat.String(),
+						"selectedOptions": selectedHex,
+						"timestamp":       evt.Info.Timestamp.Unix(),
+					},
+					"instanceToken": mycli.token,
+					"instanceId":    mycli.userID,
+					"instanceName":  mycli.Instance.Name,
+				}
+				if pollVoteJSON, mErr := json.Marshal(pollVoteMap); mErr == nil {
+					pollVoteQueue := strings.ToLower(fmt.Sprintf("%s.pollvote", mycli.userID))
+					go mycli.service.CallWebhook(mycli.Instance, pollVoteQueue, pollVoteJSON)
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Poll vote webhook dispatched (%d option(s))", mycli.userID, len(selectedHex))
+				}
+
 				// NOVO: Salvar voto no banco de dados de forma NÃO-INVASIVA
 				if mycli.pollService != nil {
 					go func() {

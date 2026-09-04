@@ -234,7 +234,17 @@ func (c *chatService) HistorySyncRequest(data *HistorySyncRequestStruct, instanc
 
 	histRequest := client.BuildHistorySyncRequest(&messageInfo, data.Count)
 
-	res, err := client.SendMessage(context.Background(), messageInfo.Chat, histRequest, whatsmeow.SendRequestExtra{Peer: true})
+	// On-demand history-sync is a PEER request: it must be sent to our OWN device (self), never to
+	// the chat/contact. Sending it to messageInfo.Chat only "worked" when a live signal session with
+	// that contact happened to exist (recent chats), returned no history, and hard-failed on dormant
+	// chats with "no signal session established" — which is exactly where we need the backfill. The
+	// contact never fulfils our history request; only our primary device does. Route to self.
+	if client.Store == nil || client.Store.ID == nil {
+		return nil, errors.New("instance not logged in (no self JID for peer history-sync)")
+	}
+	self := client.Store.ID.ToNonAD()
+
+	res, err := client.SendMessage(context.Background(), self, histRequest, whatsmeow.SendRequestExtra{Peer: true})
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error history sync request: %v", instance.Id, err)
 		return nil, err

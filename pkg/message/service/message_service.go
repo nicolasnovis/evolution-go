@@ -33,6 +33,7 @@ type MessageService interface {
 	GetMessageStatus(data *MessageStatusStruct, instance *instance_model.Instance) (*message_model.Message, string, error)
 	DeleteMessageEveryone(data *MessageStruct, instance *instance_model.Instance) (string, string, error)
 	EditMessage(data *EditMessageStruct, instance *instance_model.Instance) (string, string, error)
+	PinMessage(data *PinMessageStruct, instance *instance_model.Instance) (string, string, error)
 }
 
 type messageService struct {
@@ -91,6 +92,17 @@ type EditMessageStruct struct {
 	Chat      string `json:"chat"`
 	Message   string `json:"message"`
 	MessageID string `json:"messageId"`
+}
+
+// PinMessageStruct fixa/desafixa uma mensagem NA CONVERSA (pin-in-chat nativo do WhatsApp: aparece
+// pros dois lados). FromMe indica se a mensagem-alvo foi enviada por nós. DurationSecs = tempo do pin
+// (24h/7d/30d); ignorado no unpin.
+type PinMessageStruct struct {
+	Chat         string `json:"chat"`
+	MessageID    string `json:"messageId"`
+	FromMe       bool   `json:"fromMe"`
+	Pin          bool   `json:"pin"`
+	DurationSecs uint32 `json:"durationSecs"`
 }
 
 type MessageSendStruct struct {
@@ -555,6 +567,58 @@ func (m *messageService) EditMessage(data *EditMessageStruct, instance *instance
 			}))
 	if err != nil {
 		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error revoking message: %v", instance.Id, err)
+		return "", "", err
+	}
+
+	return resp.ID, resp.Timestamp.String(), nil
+}
+
+// PinMessage fixa (ou desafixa) uma mensagem na conversa — pin-in-chat NATIVO do WhatsApp, aparece
+// pros dois lados. Mesmo padrão do React: monta a MessageKey da mensagem-alvo e envia um
+// PinInChatMessage. A duração vai no MessageContextInfo (o WhatsApp expira o pin sozinho).
+func (m *messageService) PinMessage(data *PinMessageStruct, instance *instance_model.Instance) (string, string, error) {
+	client, err := m.ensureClientConnected(instance.Id)
+	if err != nil {
+		return "", "", err
+	}
+
+	recipient, ok := utils.ParseJID(data.Chat)
+	if !ok {
+		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error validating message fields", instance.Id)
+		return "", "", errors.New("invalid phone number")
+	}
+	recipient = utils.CanonicalJID(recipient)
+
+	pinType := waE2E.PinInChatMessage_PIN_FOR_ALL
+	if !data.Pin {
+		pinType = waE2E.PinInChatMessage_UNPIN_FOR_ALL
+	}
+
+	messageKey := &waCommon.MessageKey{
+		RemoteJID: proto.String(recipient.String()),
+		FromMe:    proto.Bool(data.FromMe),
+		ID:        proto.String(data.MessageID),
+	}
+
+	msg := &waE2E.Message{
+		PinInChatMessage: &waE2E.PinInChatMessage{
+			Key:               messageKey,
+			Type:              pinType.Enum(),
+			SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
+		},
+	}
+	// duração só no pin (o unpin não precisa)
+	if data.Pin && data.DurationSecs > 0 {
+		msg.MessageContextInfo = &waE2E.MessageContextInfo{
+			MessageAddOnDurationInSecs: proto.Uint32(data.DurationSecs),
+		}
+	}
+
+	m.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] %s message %s in %s", instance.Id, map[bool]string{true: "pinning", false: "unpinning"}[data.Pin], data.MessageID, recipient)
+
+	resp, err := client.SendMessage(context.Background(), recipient, msg)
+	if err != nil {
+		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error pinning message: %v", instance.Id, err)
 		return "", "", err
 	}
 

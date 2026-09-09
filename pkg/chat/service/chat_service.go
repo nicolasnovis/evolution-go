@@ -11,7 +11,9 @@ import (
 	whatsmeow_service "github.com/evolution-foundation/evolution-go/pkg/whatsmeow/service"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 )
 
 type ChatService interface {
@@ -32,6 +34,31 @@ type chatService struct {
 
 type BodyStruct struct {
 	Chat string `json:"chat"`
+	// Archive precisa da ÂNCORA da última mensagem do chat (timestamp + MessageKey): sem ela o
+	// WhatsApp IGNORA a mutação de arquivar (era o bug do "not working"). O Novi já conhece a última
+	// msg no banco e manda esses campos. Vazio → cai no comportamento antigo (sem âncora). Pin/Mute
+	// não usam isso. LastMessageID é o ID do WhatsApp da msg (stanza id), não o id interno do CRM.
+	LastMessageID        string `json:"lastMessageId,omitempty"`
+	LastMessageFromMe    bool   `json:"lastMessageFromMe,omitempty"`
+	LastMessageTimestamp int64  `json:"lastMessageTimestamp,omitempty"` // unix seconds
+}
+
+// archiveAnchor monta o timestamp + MessageKey da última msg do chat pra BuildArchive. Sem
+// LastMessageID devolve o par vazio (time.Time{}, nil) — o mesmo que o código fazia antes.
+func archiveAnchor(data *BodyStruct, chat types.JID) (time.Time, *waCommon.MessageKey) {
+	if data.LastMessageID == "" {
+		return time.Time{}, nil
+	}
+	key := &waCommon.MessageKey{
+		RemoteJID: proto.String(chat.String()),
+		FromMe:    proto.Bool(data.LastMessageFromMe),
+		ID:        proto.String(data.LastMessageID),
+	}
+	var ts time.Time
+	if data.LastMessageTimestamp > 0 {
+		ts = time.Unix(data.LastMessageTimestamp, 0)
+	}
+	return ts, key
 }
 
 type HistorySyncRequestStruct struct {
@@ -138,7 +165,8 @@ func (c *chatService) ChatArchive(data *BodyStruct, instance *instance_model.Ins
 		return "", errors.New("invalid phone number")
 	}
 
-	err = client.SendAppState(context.Background(), appstate.BuildArchive(recipient, true, time.Time{}, nil))
+	lastTs, lastKey := archiveAnchor(data, recipient)
+	err = client.SendAppState(context.Background(), appstate.BuildArchive(recipient, true, lastTs, lastKey))
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error archive chat: %v", instance.Id, err)
 		return "", err
@@ -161,7 +189,8 @@ func (c *chatService) ChatUnarchive(data *BodyStruct, instance *instance_model.I
 		return "", errors.New("invalid phone number")
 	}
 
-	err = client.SendAppState(context.Background(), appstate.BuildArchive(recipient, false, time.Time{}, nil))
+	lastTs, lastKey := archiveAnchor(data, recipient)
+	err = client.SendAppState(context.Background(), appstate.BuildArchive(recipient, false, lastTs, lastKey))
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unarchive chat: %v", instance.Id, err)
 		return "", err

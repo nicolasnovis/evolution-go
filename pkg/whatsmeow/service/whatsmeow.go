@@ -1933,10 +1933,25 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		dataMap["JID"] = evt.JID
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action
+		dataMap["Archived"] = evt.Action.GetArchived() // bool explícito (nil-safe) pro CRM não parsear o proto
 		dataMap["FromFullSync"] = evt.FromFullSync
 		postMap["data"] = dataMap
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat archived", mycli.userID)
+	case *events.Pin:
+		// WA→CRM: o contato fixou/desafixou a conversa no celular. Espelha o bloco do Archive.
+		doWebhook = true
+		postMap["event"] = "Pin"
+
+		dataMap := postMap["data"].(map[string]interface{})
+		dataMap["JID"] = evt.JID
+		dataMap["Timestamp"] = evt.Timestamp
+		dataMap["Action"] = evt.Action
+		dataMap["Pinned"] = evt.Action.GetPinned() // bool explícito (nil-safe) pro CRM não parsear o proto
+		dataMap["FromFullSync"] = evt.FromFullSync
+		postMap["data"] = dataMap
+
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat pin changed", mycli.userID)
 	case *events.HistorySync:
 		doWebhook = true
 		postMap["event"] = "HistorySync"

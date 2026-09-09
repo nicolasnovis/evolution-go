@@ -132,6 +132,31 @@ func archiveAnchor(data *BodyStruct, chat types.JID) (time.Time, *waCommon.Messa
 	return ts, key
 }
 
+// resolveAppStateTarget devolve o JID que o app-state de CHAT (regular_low: pin/arquivar/mute) do
+// aparelho PRIMÁRIO usa como índice. O WhatsApp migrou o endereçamento de chat pra LID: o celular
+// indexa pin/arquivar pelo <lid>@lid do contato, NÃO pelo <número>@s.whatsapp.net. Escrever a mutação
+// pelo número cai num índice que o telefone não consulta — o efeito observado é o pin/arquivo "grudar":
+// o ADD (pinned:true) até aparece porque o servidor mapeia número→contato, mas o REMOVE (pinned:false)
+// nunca limpa o índice LID que o telefone de fato exibe, então continua fixado. PROVADO no número spike
+// comparando o index_mac: nosso pin por número = 27971a60…, o do telefone e o nosso por LID = ebc21ea1…
+// (idênticos). Resolver pro LID faz o index_mac bater com o do telefone e a mutação reflete nos 2 sentidos.
+// Contatos sem LID conhecido, ou JIDs que não são de usuário (grupo/broadcast/já-@lid), caem no original.
+func (c *chatService) resolveAppStateTarget(client *whatsmeow.Client, recipient types.JID, instanceId string) types.JID {
+	if recipient.Server != types.DefaultUserServer { // só @s.whatsapp.net tem par LID; @lid/@g.us/@broadcast passam direto
+		return recipient
+	}
+	if client.Store == nil || client.Store.LIDs == nil {
+		return recipient
+	}
+	lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), recipient)
+	if err != nil || lid.IsEmpty() {
+		c.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] app-state target: sem LID pra %s, usando o número", instanceId, recipient.String())
+		return recipient
+	}
+	c.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] app-state target: %s → %s (LID)", instanceId, recipient.String(), lid.String())
+	return lid
+}
+
 type HistorySyncRequestStruct struct {
 	MessageInfo *types.MessageInfo `json:"messageInfo"`
 	Count       int                `json:"count"`
@@ -190,7 +215,8 @@ func (c *chatService) ChatPin(data *BodyStruct, instance *instance_model.Instanc
 		return "", errors.New("invalid phone number")
 	}
 
-	err = c.sendAppStateResilient(client, appstate.BuildPin(recipient, true), instance.Id)
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	err = c.sendAppStateResilient(client, appstate.BuildPin(target, true), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error pin chat: %v", instance.Id, err)
 		return "", err
@@ -213,7 +239,8 @@ func (c *chatService) ChatUnpin(data *BodyStruct, instance *instance_model.Insta
 		return "", errors.New("invalid phone number")
 	}
 
-	err = c.sendAppStateResilient(client, appstate.BuildPin(recipient, false), instance.Id)
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	err = c.sendAppStateResilient(client, appstate.BuildPin(target, false), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unpin chat: %v", instance.Id, err)
 		return "", err
@@ -236,8 +263,9 @@ func (c *chatService) ChatArchive(data *BodyStruct, instance *instance_model.Ins
 		return "", errors.New("invalid phone number")
 	}
 
-	lastTs, lastKey := archiveAnchor(data, recipient)
-	err = c.sendAppStateResilient(client, appstate.BuildArchive(recipient, true, lastTs, lastKey), instance.Id)
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	lastTs, lastKey := archiveAnchor(data, target)
+	err = c.sendAppStateResilient(client, appstate.BuildArchive(target, true, lastTs, lastKey), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error archive chat: %v", instance.Id, err)
 		return "", err
@@ -260,8 +288,9 @@ func (c *chatService) ChatUnarchive(data *BodyStruct, instance *instance_model.I
 		return "", errors.New("invalid phone number")
 	}
 
-	lastTs, lastKey := archiveAnchor(data, recipient)
-	err = c.sendAppStateResilient(client, appstate.BuildArchive(recipient, false, lastTs, lastKey), instance.Id)
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	lastTs, lastKey := archiveAnchor(data, target)
+	err = c.sendAppStateResilient(client, appstate.BuildArchive(target, false, lastTs, lastKey), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unarchive chat: %v", instance.Id, err)
 		return "", err
@@ -284,7 +313,8 @@ func (c *chatService) ChatMute(data *BodyStruct, instance *instance_model.Instan
 		return "", errors.New("invalid phone number")
 	}
 
-	err = client.SendAppState(context.Background(), appstate.BuildMute(recipient, true, 1*time.Hour))
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	err = client.SendAppState(context.Background(), appstate.BuildMute(target, true, 1*time.Hour))
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error mute chat: %v", instance.Id, err)
 		return "", err
@@ -307,7 +337,8 @@ func (c *chatService) ChatUnmute(data *BodyStruct, instance *instance_model.Inst
 		return "", errors.New("invalid phone number")
 	}
 
-	err = client.SendAppState(context.Background(), appstate.BuildMute(recipient, false, 0*time.Hour))
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	err = client.SendAppState(context.Background(), appstate.BuildMute(target, false, 0*time.Hour))
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unmute chat: %v", instance.Id, err)
 		return "", err

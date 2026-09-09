@@ -1930,7 +1930,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "Archive"
 
 		dataMap := postMap["data"].(map[string]interface{})
-		dataMap["JID"] = evt.JID
+		dataMap["JID"] = evt.JID.String() // string limpa "num@s.whatsapp.net" (igual ao Presence)
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action
 		dataMap["Archived"] = evt.Action.GetArchived() // bool explícito (nil-safe) pro CRM não parsear o proto
@@ -1944,7 +1944,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "Pin"
 
 		dataMap := postMap["data"].(map[string]interface{})
-		dataMap["JID"] = evt.JID
+		dataMap["JID"] = evt.JID.String() // string limpa "num@s.whatsapp.net" (igual ao Presence)
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action
 		dataMap["Pinned"] = evt.Action.GetPinned() // bool explícito (nil-safe) pro CRM não parsear o proto
@@ -2350,7 +2350,7 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
-	case "ChatPresence", "Archive":
+	case "ChatPresence", "Archive", "Pin":
 		if contains(subscriptions, "CHAT_PRESENCE") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
@@ -2644,7 +2644,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 				globalEventType = "PRESENCE"
 			case "HistorySync":
 				globalEventType = "HISTORY_SYNC"
-			case "ChatPresence", "Archive":
+			case "ChatPresence", "Archive", "Pin":
 				globalEventType = "CHAT_PRESENCE"
 			case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 				globalEventType = "CALL"
@@ -2706,7 +2706,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 			globalEventType = "PRESENCE"
 		case "HistorySync":
 			globalEventType = "HISTORY_SYNC"
-		case "ChatPresence", "Archive":
+		case "ChatPresence", "Archive", "Pin":
 			globalEventType = "CHAT_PRESENCE"
 		case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 			globalEventType = "CALL"

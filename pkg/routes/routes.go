@@ -170,6 +170,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/unarchive", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnarchive)   // CRM→WA: desarquiva
 			routes.POST("/mute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatMute)             // TODO: not working
 			routes.POST("/unmute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnmute)         // TODO: not working
+			routes.POST("/recover-appstate", r.chatHandler.RecoverAppState) // destrava regular_low (recovery request)
 			routes.POST("/history-sync", r.chatHandler.HistorySyncRequest)
 		}
 	}

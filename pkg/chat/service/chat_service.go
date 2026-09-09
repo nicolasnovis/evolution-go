@@ -3,7 +3,7 @@ package chat_service
 import (
 	"context"
 	"errors"
-	"strings"
+	"sync"
 	"time"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -24,6 +24,7 @@ type ChatService interface {
 	ChatUnarchive(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatMute(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatUnmute(data *BodyStruct, instance *instance_model.Instance) (string, error)
+	RecoverAppState(instance *instance_model.Instance) error
 	HistorySyncRequest(data *HistorySyncRequestStruct, instance *instance_model.Instance) (*whatsmeow.SendResponse, error)
 }
 
@@ -31,6 +32,11 @@ type chatService struct {
 	clientPointer    map[string]*whatsmeow.Client
 	whatsmeowService whatsmeow_service.WhatsmeowService
 	loggerWrapper    *logger_wrapper.LoggerManager
+	// serializa mutações de app-state POR instância. O SendAppState do whatsmeow não tem trava de
+	// topo: dois envios sobrepostos na mesma coleção (ex.: fixar + arquivar quase juntos) leem a mesma
+	// versão, ambos assinam versão+1 e o 2º toma 409 conflict — e UMA sobreposição já envenena o
+	// regular_low (trava LTHash pra sempre). Um mutex por instância mata essa corrida.
+	appStateMu sync.Map // instanceId(string) → *sync.Mutex
 }
 
 type BodyStruct struct {
@@ -44,26 +50,44 @@ type BodyStruct struct {
 	LastMessageTimestamp int64  `json:"lastMessageTimestamp,omitempty"` // unix seconds
 }
 
-// sendAppStateResilient manda a mutação de app-state (pin/arquivar) e, se o WhatsApp reclamar de
-// DESSINCRONIA (LTHash / patch mismatch no regular_low — a coleção de pin/arquivar/mute), força um
-// FULL resync dessa coleção e tenta UMA vez de novo. É o caminho de recuperação do whatsmeow pra
-// quando o estado local diverge do servidor (comum em instância re-pareada). Sem isso, pin/arquivar
-// fica preso pra sempre em HTTP 500 nessa instância.
+// sendAppStateResilient serializa a mutação de app-state (pin/arquivar) POR instância e deixa o
+// SendAppState do whatsmeow trabalhar sozinho. O SendAppState já: encoda com a versão do store, no
+// 409 conflict aplica os patches devolvidos e re-tenta 1x, e faz um resync incremental síncrono que
+// PERSISTE a versão nova. NÃO pré-full-syncamos mais (era redundante — o resync interno já faz — e no
+// estado dessincronizado só queimava round-trip). O que faltava era a TRAVA: sem ela, dois sends
+// sobrepostos assinavam a mesma versão e o 2º dava 409, envenenando a coleção. Se a coleção JÁ está
+// travada (LTHash), o erro sobe pro chamador; recuperar é via RecoverAppState (recovery request).
 func (c *chatService) sendAppStateResilient(client *whatsmeow.Client, patch appstate.PatchInfo, instanceId string) error {
-	err := client.SendAppState(context.Background(), patch)
-	if err == nil {
-		return nil
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "LTHash") && !strings.Contains(msg, "app state") && !strings.Contains(msg, "app-state") {
+	muAny, _ := c.appStateMu.LoadOrStore(instanceId, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	return client.SendAppState(context.Background(), patch)
+}
+
+// RecoverAppState pede ao aparelho PRIMÁRIO uma cópia NÃO-CRIPTOGRAFADA da coleção regular_low
+// (pin/arquivar/mute). Isso contorna a verificação de MAC — é a recuperação recomendada pelo whatsmeow
+// (issue #858) pra quando a chave de app-state dessincroniza e a coleção trava com "mismatching
+// LTHash" (nem o full-sync resolve, pois o próprio snapshot não verifica). A resposta chega como
+// PeerDataOperationResponse e o whatsmeow a processa sozinho (handleAppStateRecovery → reconstrói a
+// coleção → emite events.AppStateSyncComplete{Recovery:true}). Se o celular não responder, re-parear
+// é o único caminho. Serializa junto com os sends (mesma trava por instância).
+func (c *chatService) RecoverAppState(instance *instance_model.Instance) error {
+	client, err := c.ensureClientConnected(instance.Id)
+	if err != nil {
 		return err
 	}
-	c.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] app-state dessincronizado (%s) — full resync do regular_low + retry", instanceId, msg)
-	if ferr := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, true, false); ferr != nil {
-		c.loggerWrapper.GetLogger(instanceId).LogError("[%s] full resync do app-state falhou: %v", instanceId, ferr)
-		return err // devolve o erro ORIGINAL do send
+	muAny, _ := c.appStateMu.LoadOrStore(instance.Id, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	msg := whatsmeow.BuildAppStateRecoveryRequest(appstate.WAPatchRegularLow)
+	if _, err := client.SendPeerMessage(context.Background(), msg); err != nil {
+		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] app-state recovery request FALHOU: %v", instance.Id, err)
+		return err
 	}
-	return client.SendAppState(context.Background(), patch)
+	c.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] app-state recovery request enviado (regular_low) — aguardando o primário responder", instance.Id)
+	return nil
 }
 
 // archiveAnchor monta o timestamp + MessageKey da última msg do chat pra BuildArchive. Sem

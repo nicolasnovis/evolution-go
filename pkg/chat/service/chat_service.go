@@ -25,6 +25,7 @@ type ChatService interface {
 	ChatMute(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatUnmute(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	RecoverAppState(instance *instance_model.Instance) error
+	ResetAppState(instance *instance_model.Instance) error
 	HistorySyncRequest(data *HistorySyncRequestStruct, instance *instance_model.Instance) (*whatsmeow.SendResponse, error)
 }
 
@@ -87,6 +88,29 @@ func (c *chatService) RecoverAppState(instance *instance_model.Instance) error {
 		return err
 	}
 	c.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] app-state recovery request enviado (regular_low) — aguardando o primário responder", instance.Id)
+	return nil
+}
+
+// ResetAppState pede ao aparelho PRIMÁRIO pra RESETAR a coleção regular_low (apaga o patch envenenado
+// no SERVIDOR — o que nem re-parear nem o recovery request limpam). ⚠️ DERRUBA todos os dispositivos
+// linkados DESTE número (os companheiros: Novi/evogo + WhatsApp Web/Desktop) → o número precisa
+// re-escanear o QR depois. O primário (celular) NÃO cai. É o ÚLTIMO recurso quando a coleção trava.
+// whatsmeow.BuildFatalAppStateExceptionNotification via SendPeerMessage. Serializa junto (mutex).
+func (c *chatService) ResetAppState(instance *instance_model.Instance) error {
+	client, err := c.ensureClientConnected(instance.Id)
+	if err != nil {
+		return err
+	}
+	muAny, _ := c.appStateMu.LoadOrStore(instance.Id, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	msg := whatsmeow.BuildFatalAppStateExceptionNotification(appstate.WAPatchRegularLow)
+	if _, err := client.SendPeerMessage(context.Background(), msg); err != nil {
+		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] fatal app-state exception FALHOU: %v", instance.Id, err)
+		return err
+	}
+	c.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] fatal app-state exception enviado (RESET regular_low) — dispositivos linkados vão deslogar; re-escanear o QR depois", instance.Id)
 	return nil
 }
 

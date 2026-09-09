@@ -16,6 +16,7 @@ type ChatHandler interface {
 	ChatMute(ctx *gin.Context)
 	ChatUnmute(ctx *gin.Context)
 	RecoverAppState(ctx *gin.Context)
+	ResetAppState(ctx *gin.Context)
 	HistorySyncRequest(ctx *gin.Context)
 }
 
@@ -313,6 +314,28 @@ func (c *chatHandler) RecoverAppState(ctx *gin.Context) {
 		return
 	}
 	ctx.JSON(http.StatusOK, gin.H{"message": "recovery request sent"})
+}
+
+// ResetAppState pede ao primário pra RESETAR a regular_low. ⚠️ desloga os dispositivos linkados
+// deste número (companheiros). Sem body.
+// @Summary Reset app-state (regular_low) — fatal exception
+// @Tags Chat
+// @Produce json
+// @Success 200 {object} gin.H "success"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /chat/reset-appstate [post]
+func (c *chatHandler) ResetAppState(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+	if err := c.chatService.ResetAppState(instance); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "reset (fatal exception) sent"})
 }
 
 // HistorySyncRequest a chat

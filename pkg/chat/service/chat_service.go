@@ -3,6 +3,7 @@ package chat_service
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -41,6 +42,28 @@ type BodyStruct struct {
 	LastMessageID        string `json:"lastMessageId,omitempty"`
 	LastMessageFromMe    bool   `json:"lastMessageFromMe,omitempty"`
 	LastMessageTimestamp int64  `json:"lastMessageTimestamp,omitempty"` // unix seconds
+}
+
+// sendAppStateResilient manda a mutação de app-state (pin/arquivar) e, se o WhatsApp reclamar de
+// DESSINCRONIA (LTHash / patch mismatch no regular_low — a coleção de pin/arquivar/mute), força um
+// FULL resync dessa coleção e tenta UMA vez de novo. É o caminho de recuperação do whatsmeow pra
+// quando o estado local diverge do servidor (comum em instância re-pareada). Sem isso, pin/arquivar
+// fica preso pra sempre em HTTP 500 nessa instância.
+func (c *chatService) sendAppStateResilient(client *whatsmeow.Client, patch appstate.PatchInfo, instanceId string) error {
+	err := client.SendAppState(context.Background(), patch)
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "LTHash") && !strings.Contains(msg, "app state") && !strings.Contains(msg, "app-state") {
+		return err
+	}
+	c.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] app-state dessincronizado (%s) — full resync do regular_low + retry", instanceId, msg)
+	if ferr := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, true, false); ferr != nil {
+		c.loggerWrapper.GetLogger(instanceId).LogError("[%s] full resync do app-state falhou: %v", instanceId, ferr)
+		return err // devolve o erro ORIGINAL do send
+	}
+	return client.SendAppState(context.Background(), patch)
 }
 
 // archiveAnchor monta o timestamp + MessageKey da última msg do chat pra BuildArchive. Sem
@@ -119,7 +142,7 @@ func (c *chatService) ChatPin(data *BodyStruct, instance *instance_model.Instanc
 		return "", errors.New("invalid phone number")
 	}
 
-	err = client.SendAppState(context.Background(), appstate.BuildPin(recipient, true))
+	err = c.sendAppStateResilient(client, appstate.BuildPin(recipient, true), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error pin chat: %v", instance.Id, err)
 		return "", err
@@ -142,7 +165,7 @@ func (c *chatService) ChatUnpin(data *BodyStruct, instance *instance_model.Insta
 		return "", errors.New("invalid phone number")
 	}
 
-	err = client.SendAppState(context.Background(), appstate.BuildPin(recipient, false))
+	err = c.sendAppStateResilient(client, appstate.BuildPin(recipient, false), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unpin chat: %v", instance.Id, err)
 		return "", err
@@ -166,7 +189,7 @@ func (c *chatService) ChatArchive(data *BodyStruct, instance *instance_model.Ins
 	}
 
 	lastTs, lastKey := archiveAnchor(data, recipient)
-	err = client.SendAppState(context.Background(), appstate.BuildArchive(recipient, true, lastTs, lastKey))
+	err = c.sendAppStateResilient(client, appstate.BuildArchive(recipient, true, lastTs, lastKey), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error archive chat: %v", instance.Id, err)
 		return "", err
@@ -190,7 +213,7 @@ func (c *chatService) ChatUnarchive(data *BodyStruct, instance *instance_model.I
 	}
 
 	lastTs, lastKey := archiveAnchor(data, recipient)
-	err = client.SendAppState(context.Background(), appstate.BuildArchive(recipient, false, lastTs, lastKey))
+	err = c.sendAppStateResilient(client, appstate.BuildArchive(recipient, false, lastTs, lastKey), instance.Id)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error unarchive chat: %v", instance.Id, err)
 		return "", err

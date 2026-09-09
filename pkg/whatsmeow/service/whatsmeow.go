@@ -1929,7 +1929,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "Archive"
 
-		dataMap := postMap["data"].(map[string]interface{})
+		// map FRESCO: postMap["data"] começa como o evento CRU (*events.Archive); assertar
+		// .(map[...]) nele dava panic (bug pré-existente do fork). Montamos só os campos que o CRM lê.
+		dataMap := make(map[string]interface{})
 		dataMap["JID"] = evt.JID.String() // string limpa "num@s.whatsapp.net" (igual ao Presence)
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action
@@ -1943,7 +1945,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		doWebhook = true
 		postMap["event"] = "Pin"
 
-		dataMap := postMap["data"].(map[string]interface{})
+		// map FRESCO (mesmo motivo do Archive acima — o evento cru daria panic no .(map[...])).
+		dataMap := make(map[string]interface{})
 		dataMap["JID"] = evt.JID.String() // string limpa "num@s.whatsapp.net" (igual ao Presence)
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action

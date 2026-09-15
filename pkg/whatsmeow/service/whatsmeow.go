@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image/png"
 	"io"
@@ -890,6 +891,106 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	}
 }
 
+// ----- app-state auto-heal (defense-in-depth against regular_low/regular/regular_high poisoning) -----
+//
+// A chat app-state collection (pin/archive/mute) can desync: a local patch application fails the
+// LTHash/MAC check and whatsmeow emits events.AppStateSyncError but does NOT recover, so the
+// collection stays broken and archive/pin no longer mirror in either direction until a manual
+// reset-appstate + QR re-scan. This heals the recoverable case (local-only divergence) automatically
+// with a full resync from the server snapshot — no logout, no QR. The unrecoverable case (a poisoned
+// patch already published to the server) re-applies the same bad data on a full sync, so we detect
+// the MAC/LTHash mismatch coming back and STOP, flagging it for a deliberate reset-appstate.
+type appStateHealEntry struct {
+	mu          sync.Mutex
+	lastAttempt time.Time
+	attempts    int
+	poisoned    bool // server-side poison: a full resync can't fix it, only reset-appstate + re-scan
+}
+
+// keyed by instanceId + "|" + patchName; lives at package scope so backoff survives client
+// reconnects (a reconnect storm must not reset the cap).
+var appStateHeal sync.Map
+
+func appStateHealEntryFor(key string) *appStateHealEntry {
+	v, _ := appStateHeal.LoadOrStore(key, &appStateHealEntry{})
+	return v.(*appStateHealEntry)
+}
+
+// clearAppStateHeal resets the backoff/poison flag for a collection that just synced cleanly.
+func clearAppStateHeal(key string) {
+	if v, ok := appStateHeal.Load(key); ok {
+		ent := v.(*appStateHealEntry)
+		ent.mu.Lock()
+		ent.attempts = 0
+		ent.poisoned = false
+		ent.mu.Unlock()
+	}
+}
+
+// isServerPoison reports whether a decode failure means the SERVER's app-state data is bad (a
+// poisoned patch/snapshot). A full resync re-downloads and re-applies it, so it fails identically —
+// retrying is pointless; only reset-appstate (fatal exception) + re-scan recovers.
+func isServerPoison(err error) bool {
+	return errors.Is(err, appstate.ErrMismatchingLTHash) ||
+		errors.Is(err, appstate.ErrMismatchingPatchMAC) ||
+		errors.Is(err, appstate.ErrMismatchingContentMAC) ||
+		errors.Is(err, appstate.ErrMismatchingIndexMAC)
+}
+
+// healAppState runs OFF the event goroutine (see the AppStateSyncError case). A full resync
+// (FetchAppState with fullSync=true) drops the diverged local state and rebuilds the collection from
+// the server snapshot, curing local-only corruption without logout/QR. Debounced (60s) and capped
+// (3/h) so a persistently failing collection can't spin. TryLock so a burst of sync errors coalesces
+// into one in-flight heal per collection.
+func (mycli *MyClient) healAppState(name appstate.WAPatchName, fullSync bool, syncErr error) {
+	log := mycli.loggerWrapper.GetLogger(mycli.userID)
+	ent := appStateHealEntryFor(mycli.userID + "|" + string(name))
+	if !ent.mu.TryLock() {
+		return // a heal for this collection is already in progress
+	}
+	defer ent.mu.Unlock()
+
+	// fullSync=true means the resync ITSELF failed. If the server data is poisoned, another full sync
+	// fails the same way — stop and flag for a manual reset-appstate.
+	if fullSync {
+		if isServerPoison(syncErr) {
+			ent.poisoned = true
+			log.LogError("[%s] app-state %s ENVENENADO NO SERVIDOR (full sync falhou: %v) — precisa reset-appstate + re-escanear o QR; auto-cura não resolve", mycli.userID, name, syncErr)
+		}
+		return
+	}
+	if ent.poisoned {
+		return // already known unrecoverable without a reset
+	}
+	now := time.Now()
+	if now.Sub(ent.lastAttempt) < 60*time.Second {
+		return // debounce a burst of sync errors
+	}
+	if ent.attempts >= 3 && now.Sub(ent.lastAttempt) < time.Hour {
+		return // cap: don't spin on a persistently failing collection
+	}
+	ent.attempts++
+	ent.lastAttempt = now
+	log.LogWarn("[%s] app-state %s dessincronizado (%v) — auto-cura: full resync do snapshot do servidor (tentativa %d)", mycli.userID, name, syncErr, ent.attempts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	err := mycli.WAClient.FetchAppState(ctx, name, true, false)
+	switch {
+	case err == nil:
+		ent.attempts = 0
+		ent.poisoned = false
+		log.LogInfo("[%s] app-state %s AUTO-CURADO (full resync ok)", mycli.userID, name)
+	case isServerPoison(err):
+		ent.poisoned = true
+		log.LogError("[%s] app-state %s: full resync falhou (%v) → envenenado no servidor, precisa reset-appstate + re-escanear o QR", mycli.userID, name, err)
+	case errors.Is(err, appstate.ErrKeyNotFound):
+		log.LogWarn("[%s] app-state %s: faltam chaves de sync; whatsmeow já pediu ao celular, re-sincroniza ao receber a chave", mycli.userID, name)
+	default:
+		log.LogError("[%s] app-state %s: full resync falhou (transitório?): %v", mycli.userID, name, err)
+	}
+}
+
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	userID := mycli.userID
 	postMap := make(map[string]interface{})
@@ -903,6 +1004,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		mycli.handleQRCodes(evt.Codes)
 		return
 	case *events.AppStateSyncComplete:
+		// A collection just resynced cleanly — clear any auto-heal backoff/poison flag for it.
+		clearAppStateHeal(mycli.userID + "|" + string(evt.Name))
 		if len(mycli.WAClient.Store.PushName) > 0 && evt.Name == appstate.WAPatchCriticalBlock {
 			err := mycli.WAClient.SendPresence(context.Background(), types.PresenceUnavailable)
 			if err != nil {
@@ -911,6 +1014,14 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Marked self as unavailable", mycli.userID)
 			}
 		}
+	case *events.AppStateSyncError:
+		// whatsmeow failed to apply an app-state patch (LTHash/MAC mismatch). It emits this event but
+		// never self-heals, so the collection (pin/archive/mute live in regular_low/regular/regular_high)
+		// would stay broken until a manual reset-appstate + QR re-scan. Auto-heal below.
+		// MUST run off this goroutine: the event is dispatched while whatsmeow holds its internal
+		// appStateSyncLock, so calling FetchAppState inline would DEADLOCK (non-reentrant mutex).
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] events.AppStateSyncError %s (fullSync=%v): %v", mycli.userID, evt.Name, evt.FullSync, evt.Error)
+		go mycli.healAppState(evt.Name, evt.FullSync, evt.Error)
 	case *events.Connected, *events.PushNameSetting:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
 		if len(mycli.WAClient.Store.PushName) > 0 {

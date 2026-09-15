@@ -7,8 +7,9 @@ WORKDIR /build
 # Copiar apenas arquivos de dependências primeiro para cachear o download
 COPY go.mod go.sum ./
 
-# whatsmeow agora vem do proxy oficial (go.mau.fi/whatsmeow, sem replace local) —
-# não há mais submódulo whatsmeow-lib para copiar.
+# whatsmeow é um fork local (replace go.mau.fi/whatsmeow => ./whatsmeow-lib no go.mod) —
+# precisa estar no contexto antes do download pra o `go mod download` resolver o replace.
+COPY whatsmeow-lib ./whatsmeow-lib
 RUN go mod download
 
 # Copiar o restante do código

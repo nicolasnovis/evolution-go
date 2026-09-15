@@ -613,8 +613,8 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	for {
 		select {
-		case <-w.killChannel[cd.Instance.Id]:
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
+		case restart := <-w.killChannel[cd.Instance.Id]:
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s' (restart=%v)", cd.Instance.Id, restart)
 			client.Disconnect()
 
 			delete(w.clientPointer, cd.Instance.Id)
@@ -663,9 +663,17 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
-			// restart client
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
-			w.StartClient(cd)
+			// 🔴 SÓ reinicia se o kill pediu restart (valor `true`). Logout 401 e timeout de QR
+			// mandam `false` — NÃO reiniciar: no logout o Store foi apagado, então o StartClient
+			// criaria um device NOVO, cairia em pareamento e geraria QR pra sempre (o loop de 226
+			// QRs em 1h30 visto em produção). Após logout/QR-timeout a instância fica desconectada
+			// aguardando um connect EXPLÍCITO (que chama StartClient direto, não por este loop).
+			if restart {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
+				w.StartClient(cd)
+			} else {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Kill sem restart (logout/QR-timeout) — aguardando connect explícito", cd.Instance.Id)
+			}
 			return
 		default:
 			time.Sleep(1000 * time.Millisecond)
@@ -742,6 +750,8 @@ func processPresenceUpdates(mycli *MyClient) {
 func (mycli *MyClient) handleQRCodes(codes []string) {
 	go func() {
 		instanceID := mycli.userID
+		pairStart := time.Now()
+		const qrPairDeadline = 3 * time.Minute // teto de relógio: para de gerar QR se ninguém escanear
 		for i, code := range codes {
 			// A successful pair (Store.ID set) or an in-flight passkey ceremony
 			// supersedes QR — stop rotating WITHOUT tearing down. Store.ID stays
@@ -753,6 +763,15 @@ func (mycli *MyClient) handleQRCodes(codes []string) {
 			}
 			if mycli.passkeyCeremony != nil && mycli.passkeyCeremony.HasActiveByInstance(instanceID) {
 				mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Passkey ceremony in progress — pausing QR rotation, keeping socket alive", instanceID)
+				return
+			}
+
+			// 🔴 Timeout de pareamento por RELÓGIO: mesmo que o whatsmeow alimente muitos códigos,
+			// para de rotacionar após qrPairDeadline sem scan (fecha o socket de pareamento).
+			// Belt-and-suspenders com o A1 (que já impede o re-loop depois que o batch acaba).
+			if time.Since(pairStart) > qrPairDeadline {
+				mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Pairing timeout (%s) sem scan — encerrando QR", instanceID, qrPairDeadline)
+				mycli.teardownQR("Pairing timeout", true)
 				return
 			}
 
@@ -887,8 +906,10 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	// maps (it is the single writer for this instance). Blocking send mirrors
 	// the original timeout branch so the signal is never dropped.
 	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
+	// `false` = NÃO reiniciar: pareamento expirou sem scan; reiniciar geraria um novo batch de QR
+	// em loop. A instância fica desconectada aguardando connect explícito.
 	if killChan, exists := mycli.killChannel[instanceID]; exists {
-		killChan <- true
+		killChan <- false
 	}
 }
 
@@ -2099,8 +2120,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 
-		// Agora mata o canal DEPOIS de enviar o evento
-		mycli.killChannel[mycli.userID] <- true
+		// Agora mata o canal DEPOIS de enviar o evento.
+		// `false` = NÃO reiniciar: a sessão foi apagada no logout; reiniciar geraria QR infinito.
+		mycli.killChannel[mycli.userID] <- false
 	case *events.ChatPresence:
 		doWebhook = true
 		postMap["event"] = "ChatPresence"

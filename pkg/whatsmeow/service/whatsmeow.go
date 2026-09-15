@@ -661,6 +661,16 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
+			// Never-paired device (QR codes ran out, nobody scanned): restarting would
+			// register a brand-new device identity and start another QR round, forever.
+			// That loop hammers WhatsApp from the same IP until it refuses to link
+			// ("Can't link new devices at this time"). Stop here; a new /instance/connect
+			// starts a fresh round when someone is actually ready to scan.
+			if client.Store.ID == nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Not paired — client stopped after kill (no automatic QR restart)", cd.Instance.Id)
+				return
+			}
+
 			// restart client
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
 			w.StartClient(cd)

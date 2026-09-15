@@ -3,9 +3,11 @@ package chat_service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
+	"github.com/evolution-foundation/evolution-go/pkg/appstatehealth"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 	"github.com/evolution-foundation/evolution-go/pkg/utils"
@@ -59,11 +61,25 @@ type BodyStruct struct {
 // sobrepostos assinavam a mesma versão e o 2º dava 409, envenenando a coleção. Se a coleção JÁ está
 // travada (LTHash), o erro sobe pro chamador; recuperar é via RecoverAppState (recovery request).
 func (c *chatService) sendAppStateResilient(client *whatsmeow.Client, patch appstate.PatchInfo, instanceId string) error {
+	coll := string(patch.Type)
+	// Guard 1: never publish onto a collection flagged poisoned (its server-side snapshot can't be
+	// verified). Another patch would only pile more bad data onto it — the toggle stays local in the
+	// CRM until a reset-appstate + re-scan. The auto-heal sets/clears this flag (appstatehealth).
+	if appstatehealth.IsPoisoned(instanceId, coll) {
+		return fmt.Errorf("app-state %s da instância %s está envenenado (aguardando reset+QR) — envio pulado", coll, instanceId)
+	}
 	muAny, _ := c.appStateMu.LoadOrStore(instanceId, &sync.Mutex{})
 	mu := muAny.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
-	return client.SendAppState(context.Background(), patch)
+	ctx := context.Background()
+	// Guard 2 (belt-and-suspenders): catch up to the server's latest version before publishing, so we
+	// never build a patch on a stale base. Best-effort — on error we still try the send, whose own
+	// 409-conflict path (now atomic + locked) re-applies server patches and retries safely.
+	if err := client.FetchAppState(ctx, patch.Type, false, false); err != nil {
+		c.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] sync-before-send de %s falhou (seguindo mesmo assim): %v", instanceId, coll, err)
+	}
+	return client.SendAppState(ctx, patch)
 }
 
 // RecoverAppState pede ao aparelho PRIMÁRIO uma cópia NÃO-CRIPTOGRAFADA da coleção regular_low

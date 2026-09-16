@@ -947,8 +947,9 @@ func (mycli *MyClient) healAppState(name appstate.WAPatchName, fullSync bool, sy
 	// fails the same way — flag it and stop.
 	if fullSync {
 		if isServerPoison(syncErr) {
-			appstatehealth.MarkPoisoned(mycli.userID, coll)
-			log.LogError("[%s] app-state %s ENVENENADO NO SERVIDOR (full sync falhou: %v) — precisa reset-appstate + re-escanear o QR; auto-cura não resolve", mycli.userID, name, syncErr)
+			// The full resync ITSELF failed the MAC/LTHash check — the server snapshot re-applies the
+			// same diverged patch. Before giving up, try the recovery request (issue #858 step 2).
+			mycli.escalatePoison(name, syncErr)
 		}
 		return
 	}
@@ -965,13 +966,45 @@ func (mycli *MyClient) healAppState(name appstate.WAPatchName, fullSync bool, sy
 		appstatehealth.MarkHealed(mycli.userID, coll)
 		log.LogInfo("[%s] app-state %s AUTO-CURADO (full resync ok)", mycli.userID, name)
 	case isServerPoison(err):
-		appstatehealth.MarkPoisoned(mycli.userID, coll)
-		log.LogError("[%s] app-state %s: full resync falhou (%v) → envenenado no servidor, precisa reset-appstate + re-escanear o QR", mycli.userID, name, err)
+		// Our own full resync failed the MAC/LTHash check → server-side poison. Try the recovery
+		// request (issue #858 step 2) before falling back to the manual reset-appstate + QR.
+		mycli.escalatePoison(name, err)
 	case errors.Is(err, appstate.ErrKeyNotFound):
 		log.LogWarn("[%s] app-state %s: faltam chaves de sync; whatsmeow já pediu ao celular, re-sincroniza ao receber a chave", mycli.userID, name)
 	default:
 		log.LogError("[%s] app-state %s: full resync falhou (transitório?): %v", mycli.userID, name, err)
 	}
+}
+
+// escalatePoison handles a collection whose full resync ALSO failed with a server-side MAC/LTHash
+// mismatch — the case where re-downloading the snapshot re-applies the same diverged patch and can't
+// self-heal. Before giving up (MarkPoisoned → the send path refuses to publish and the fix is a manual
+// reset-appstate + QR re-scan), it tries whatsmeow's RECOVERY REQUEST (issue #858 step 2, the rung the
+// auto-heal previously skipped): ask the primary device for an UNCRYPTED snapshot of the collection.
+// whatsmeow processes the response on its own (ProcessRecovery resets version+hash from the primary's
+// snapshot, bypassing the poisoned patch chain → emits events.AppStateSyncComplete → Clear), so it
+// heals WITHOUT a logout/QR. We do NOT mark poison after sending: we wait for that snapshot. Only when
+// the recovery cap is exhausted (the primary never answers, or the mismatch keeps recurring) do we mark
+// it poisoned and require the manual reset. Runs off the event goroutine (same as healAppState);
+// SendPeerMessage does not touch the app-state version counter, so no app-state lock is needed.
+func (mycli *MyClient) escalatePoison(name appstate.WAPatchName, syncErr error) {
+	log := mycli.loggerWrapper.GetLogger(mycli.userID)
+	coll := string(name)
+	if !appstatehealth.ShouldAttemptRecovery(mycli.userID, coll) {
+		appstatehealth.MarkPoisoned(mycli.userID, coll)
+		log.LogError("[%s] app-state %s: recovery request esgotado, ainda com mismatch (%v) — precisa reset-appstate + re-escanear o QR", mycli.userID, name, syncErr)
+		return
+	}
+	msg := whatsmeow.BuildAppStateRecoveryRequest(name)
+	if _, err := mycli.WAClient.SendPeerMessage(context.Background(), msg); err != nil {
+		appstatehealth.MarkPoisoned(mycli.userID, coll)
+		log.LogError("[%s] app-state %s: recovery request FALHOU no envio (%v) — precisa reset-appstate + re-escanear o QR", mycli.userID, name, err)
+		return
+	}
+	// Leave the flag CLEAR: the primary's recovery snapshot arrives asynchronously as
+	// AppStateSyncComplete (→ Clear). If it never comes / the mismatch recurs, the next escalation
+	// exhausts the cap above and marks poison.
+	log.LogWarn("[%s] app-state %s ENVENENADO — recovery request enviado ao primário (issue #858, snapshot não-criptografado); aguardando a cura. Se não vier, cai pra reset-appstate + QR", mycli.userID, name)
 }
 
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {

@@ -22,13 +22,20 @@ const (
 	healDebounce = 60 * time.Second // ignore repeated sync errors within this window
 	healCap      = 3                // max resync attempts per collection within healCapWindow
 	healCapWindow = time.Hour
+	// A recovery request (whatsmeow issue #858 step 2) asks the primary device for an uncrypted
+	// snapshot that bypasses the diverged patch chain. It's the rung between "a full resync failed"
+	// and "give up / mark poisoned". Cap it so a primary that never answers can't spin peer messages.
+	recoveryCap       = 2
+	recoveryCapWindow = time.Hour
 )
 
 type entry struct {
 	mu          sync.Mutex // guards the fields below; held only for short, non-blocking sections
 	lastAttempt time.Time
 	attempts    int
-	poisoned    bool // server-side poison: a full resync can't fix it, only reset-appstate + re-scan
+	recoveryAt  time.Time // last recovery request sent
+	recoveries  int       // recovery requests sent in the current window
+	poisoned    bool      // server-side poison: a full resync can't fix it, only reset-appstate + re-scan
 }
 
 var registry sync.Map // key: instanceId + "|" + collection -> *entry
@@ -62,11 +69,36 @@ func ShouldAttemptHeal(instanceID, collection string) bool {
 	return true
 }
 
-// MarkHealed clears the backoff and poison flag after a successful resync or a clean sync complete.
+// ShouldAttemptRecovery reports whether an app-state RECOVERY REQUEST (BuildAppStateRecoveryRequest →
+// SendPeerMessage, whatsmeow issue #858 step 2) should be sent NOW for this collection, recording the
+// attempt if so. This is the rung between "a full resync failed with a MAC/LTHash mismatch" and "give
+// up / mark poisoned": the primary is asked for an uncrypted snapshot that bypasses the diverged patch
+// chain (ProcessRecovery resets version+hash from it → AppStateSyncComplete → Clear), healing WITHOUT a
+// re-scan. Capped (recoveryCap per recoveryCapWindow) so a primary that never answers can't spin peer
+// messages — after the cap the caller falls through to MarkPoisoned (manual reset-appstate + QR).
+func ShouldAttemptRecovery(instanceID, collection string) bool {
+	e := get(instanceID, collection)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := time.Now()
+	if now.Sub(e.recoveryAt) >= recoveryCapWindow {
+		e.recoveries = 0 // window elapsed — fresh budget
+	}
+	if e.recoveries >= recoveryCap {
+		return false
+	}
+	e.recoveries++
+	e.recoveryAt = now
+	return true
+}
+
+// MarkHealed clears the backoff, recovery budget and poison flag after a successful resync or a clean
+// sync complete (including a recovery snapshot, which arrives as AppStateSyncComplete).
 func MarkHealed(instanceID, collection string) {
 	e := get(instanceID, collection)
 	e.mu.Lock()
 	e.attempts = 0
+	e.recoveries = 0
 	e.poisoned = false
 	e.mu.Unlock()
 }

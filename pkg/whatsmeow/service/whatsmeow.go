@@ -40,6 +40,7 @@ import (
 	producer_interfaces "github.com/evolution-foundation/evolution-go/pkg/events/interfaces"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	instance_repository "github.com/evolution-foundation/evolution-go/pkg/instance/repository"
+	"github.com/evolution-foundation/evolution-go/pkg/internal/client_registry"
 	"github.com/evolution-foundation/evolution-go/pkg/internal/event_types"
 	label_model "github.com/evolution-foundation/evolution-go/pkg/label/model"
 	label_repository "github.com/evolution-foundation/evolution-go/pkg/label/repository"
@@ -176,8 +177,16 @@ type ProxyConfig struct {
 func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
+	// Snapshot the runtime entries under the read lock; the network/channel work
+	// below runs WITHOUT the lock held.
+	client_registry.Mu.RLock()
+	client, exists := w.clientPointer[instanceId]
+	mycli, hasMyCli := w.myClientPointer[instanceId]
+	killChan, hasKill := w.killChannel[instanceId]
+	client_registry.Mu.RUnlock()
+
 	// Passo 1: Limpar conexão existente se houver
-	if client, exists := w.clientPointer[instanceId]; exists {
+	if exists {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Disconnecting existing client", instanceId)
 
 		// Desconectar o cliente WebSocket
@@ -187,7 +196,7 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 		}
 
 		// Remover event handler se existir
-		if mycli, ok := w.myClientPointer[instanceId]; ok {
+		if hasMyCli {
 			if mycli.eventHandlerID != 0 {
 				client.RemoveEventHandler(mycli.eventHandlerID)
 				w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Event handler removed", instanceId)
@@ -199,7 +208,7 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Cleaning up resources", instanceId)
 
 	// Enviar sinal de kill se o canal existir
-	if killChan, exists := w.killChannel[instanceId]; exists {
+	if hasKill {
 		select {
 		case killChan <- true:
 			w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Kill signal sent", instanceId)
@@ -209,9 +218,11 @@ func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	}
 
 	// Remover das estruturas
+	client_registry.Mu.Lock()
 	delete(w.clientPointer, instanceId)
 	delete(w.myClientPointer, instanceId)
 	delete(w.killChannel, instanceId)
+	client_registry.Mu.Unlock()
 
 	// Limpar cache de userInfo para esta instância
 	if instance, err := w.instanceRepository.GetInstanceByID(instanceId); err == nil {
@@ -350,8 +361,28 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	var deviceStore *store.Device
 	var err error
 
-	if w.clientPointer[cd.Instance.Id] != nil {
-		if w.clientPointer[cd.Instance.Id].IsConnected() {
+	// Serialize the SETUP phase (existence check -> device store -> client
+	// registration -> Connect) per instance, so two StartClient calls for the
+	// same id (e.g. ReconnectClient racing an explicit /instance/connect) cannot
+	// interleave and overwrite each other's client. The lock is released BEFORE
+	// entering the long-lived kill loop below; it is never held together with
+	// client_registry.Mu beyond a single map access.
+	startLock := client_registry.StartLock(cd.Instance.Id)
+	startLock.Lock()
+	setupLocked := true
+	unlockSetup := func() {
+		if setupLocked {
+			setupLocked = false
+			startLock.Unlock()
+		}
+	}
+	defer unlockSetup()
+
+	client_registry.Mu.RLock()
+	existing := w.clientPointer[cd.Instance.Id]
+	client_registry.Mu.RUnlock()
+	if existing != nil {
+		if existing.IsConnected() {
 			return
 		}
 	}
@@ -451,7 +482,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	clientLog := waLog.Stdout("Client", minLevel, true)
 	client := whatsmeow.NewClient(deviceStore, clientLog)
 
+	client_registry.Mu.Lock()
 	w.clientPointer[cd.Instance.Id] = client
+	client_registry.Mu.Unlock()
 
 	if cd.IsProxy {
 		var proxyConfig ProxyConfig
@@ -539,7 +572,9 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	mycli.eventHandlerID = mycli.WAClient.AddEventHandler(mycli.myEventHandler)
 
 	// Armazena o MyClient no map para permitir atualizações posteriores
+	client_registry.Mu.Lock()
 	w.myClientPointer[cd.Instance.Id] = mycli
+	client_registry.Mu.Unlock()
 
 	if client.Store.ID != nil {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Already logged in with JID: %s", cd.Instance.Id, client.Store.ID.String())
@@ -611,14 +646,27 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	// Removed auto-reconnect logic to prevent infinite loops
 
+	// Setup is done (client registered + Connect returned): release the
+	// per-instance lock before parking in the kill loop for the client's lifetime.
+	unlockSetup()
+
 	for {
+		// Same semantics as the original `<-w.killChannel[id]` select case (a
+		// nil/missing channel never fires and we fall to `default`), just with
+		// the map read taken under the read lock.
+		client_registry.Mu.RLock()
+		killChan := w.killChannel[cd.Instance.Id]
+		client_registry.Mu.RUnlock()
+
 		select {
-		case restart := <-w.killChannel[cd.Instance.Id]:
+		case restart := <-killChan:
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s' (restart=%v)", cd.Instance.Id, restart)
 			client.Disconnect()
 
+			client_registry.Mu.Lock()
 			delete(w.clientPointer, cd.Instance.Id)
 			delete(w.myClientPointer, cd.Instance.Id)
+			client_registry.Mu.Unlock()
 
 			// Limpar cache de userInfo para esta instância
 			w.userInfoCache.Delete(cd.Instance.Token)
@@ -686,6 +734,10 @@ func schedulePresenceUpdates(mycli *MyClient) {
 	defer ticker.Stop()
 
 	for {
+		client_registry.Mu.RLock()
+		killChan := mycli.killChannel[mycli.userID]
+		client_registry.Mu.RUnlock()
+
 		select {
 		case <-ticker.C:
 			// Verificar se a instância ainda existe
@@ -701,7 +753,7 @@ func schedulePresenceUpdates(mycli *MyClient) {
 			randomInterval := time.Duration(1+rand.Intn(3)) * time.Hour
 			ticker = time.NewTicker(randomInterval)
 
-		case <-mycli.killChannel[mycli.userID]:
+		case <-killChan:
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Received kill signal, stopping presence updates", mycli.userID)
 			return // Encerra a goroutine quando receber sinal de kill
 		}
@@ -908,7 +960,10 @@ func (mycli *MyClient) teardownQR(reason string, forceLogout bool) {
 	mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] QR timeout — signaling kill channel", instanceID)
 	// `false` = NÃO reiniciar: pareamento expirou sem scan; reiniciar geraria um novo batch de QR
 	// em loop. A instância fica desconectada aguardando connect explícito.
-	if killChan, exists := mycli.killChannel[instanceID]; exists {
+	client_registry.Mu.RLock()
+	killChan, exists := mycli.killChannel[instanceID]
+	client_registry.Mu.RUnlock()
+	if exists {
 		killChan <- false
 	}
 }
@@ -1357,7 +1412,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// key derivation (MAC failure). Decrypting first, with the untouched @lid Sender, fixes it.
 		// Failure degrades to the old marker-only behaviour (tag "edited", text unchanged).
 		if enc := evt.Message.GetSecretEncryptedMessage(); enc != nil && enc.GetSecretEncType() == waE2E.SecretEncryptedMessage_MESSAGE_EDIT {
-			decrypted, err := mycli.clientPointer[mycli.userID].DecryptSecretEncryptedMessage(context.Background(), evt)
+			client_registry.Mu.RLock()
+			editClient := mycli.clientPointer[mycli.userID]
+			client_registry.Mu.RUnlock()
+			decrypted, err := editClient.DecryptSecretEncryptedMessage(context.Background(), evt)
 			if err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt edited message: %v", mycli.userID, err)
 			} else {
@@ -1473,7 +1531,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				fmt.Printf("[POLL DEBUG] ✅ mycli.WAClient is initialized: %s\n", mycli.WAClient.Store.ID)
 			}
 
-			decrypted, err := mycli.clientPointer[mycli.userID].DecryptPollVote(context.Background(), evt)
+			client_registry.Mu.RLock()
+			pollClient := mycli.clientPointer[mycli.userID]
+			client_registry.Mu.RUnlock()
+			decrypted, err := pollClient.DecryptPollVote(context.Background(), evt)
 			if err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to decrypt vote: %v", mycli.userID, err)
 			} else {
@@ -2155,7 +2216,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		// Agora mata o canal DEPOIS de enviar o evento.
 		// `false` = NÃO reiniciar: a sessão foi apagada no logout; reiniciar geraria QR infinito.
-		mycli.killChannel[mycli.userID] <- false
+		// (Blocking send, done OUTSIDE the registry lock: the receiver — StartClient's
+		// kill loop — takes the write lock to clean the maps.)
+		client_registry.Mu.RLock()
+		logoutKillChan := mycli.killChannel[mycli.userID]
+		client_registry.Mu.RUnlock()
+		logoutKillChan <- false
 	case *events.ChatPresence:
 		doWebhook = true
 		postMap["event"] = "ChatPresence"
@@ -2651,7 +2717,9 @@ func (w whatsmeowService) StartInstance(instanceId string) error {
 		}
 	}
 
+	client_registry.Mu.Lock()
 	w.killChannel[instance.Id] = make(chan bool)
+	client_registry.Mu.Unlock()
 
 	clientData := &ClientData{
 		Instance:      instance,
@@ -2952,7 +3020,9 @@ func (w whatsmeowService) UpdateInstanceSettings(instanceId string) error {
 	}
 
 	// Verifica se o MyClient existe
+	client_registry.Mu.RLock()
 	myClient, exists := w.myClientPointer[instanceId]
+	client_registry.Mu.RUnlock()
 	if !exists {
 		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] MyClient not found in runtime, instance may not be connected", instanceId)
 		return fmt.Errorf("instance %s not found in runtime", instanceId)
@@ -3011,7 +3081,9 @@ func (w whatsmeowService) UpdateInstanceAdvancedSettings(instanceId string) erro
 	}
 
 	// Verifica se o MyClient existe
+	client_registry.Mu.RLock()
 	myClient, exists := w.myClientPointer[instanceId]
+	client_registry.Mu.RUnlock()
 	if !exists {
 		w.loggerWrapper.GetLogger(instanceId).LogWarn("[%s] MyClient not found in runtime, instance may not be connected", instanceId)
 		return fmt.Errorf("instance %s not found in runtime", instanceId)
@@ -3030,20 +3102,29 @@ func (w whatsmeowService) ClearInstanceCache(instanceId string, token string) er
 	// Limpar userInfoCache
 	w.userInfoCache.Delete(token)
 
+	// Remove the three runtime entries under ONE write lock; the channel
+	// signal/close happens afterwards, outside the lock.
+	client_registry.Mu.Lock()
+	_, hadMyClient := w.myClientPointer[instanceId]
+	delete(w.myClientPointer, instanceId)
+	_, hadClient := w.clientPointer[instanceId]
+	delete(w.clientPointer, instanceId)
+	killChan, hadKill := w.killChannel[instanceId]
+	delete(w.killChannel, instanceId)
+	client_registry.Mu.Unlock()
+
 	// Limpar myClientPointer se existir
-	if _, exists := w.myClientPointer[instanceId]; exists {
-		delete(w.myClientPointer, instanceId)
+	if hadMyClient {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] MyClient pointer cleared", instanceId)
 	}
 
 	// Limpar clientPointer se existir
-	if _, exists := w.clientPointer[instanceId]; exists {
-		delete(w.clientPointer, instanceId)
+	if hadClient {
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Client pointer cleared", instanceId)
 	}
 
 	// Limpar killChannel se existir
-	if killChan, exists := w.killChannel[instanceId]; exists {
+	if hadKill {
 		select {
 		case killChan <- true:
 			// Canal recebeu o sinal
@@ -3051,7 +3132,6 @@ func (w whatsmeowService) ClearInstanceCache(instanceId string, token string) er
 			// Canal pode estar bloqueado, apenas fecha
 		}
 		close(killChan)
-		delete(w.killChannel, instanceId)
 		w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Kill channel cleared", instanceId)
 	}
 
@@ -3117,7 +3197,9 @@ func (w *whatsmeowService) PasskeyCeremonyStore() *ceremony.Store {
 // SubmitPasskeyResponse forwards the browser's WebAuthn assertion to WhatsApp
 // for the given instance. Called by POST /passkey-ceremony/{token}/response.
 func (w *whatsmeowService) SubmitPasskeyResponse(instanceId string, resp *types.WebAuthnResponse) error {
+	client_registry.Mu.RLock()
 	client, ok := w.clientPointer[instanceId]
+	client_registry.Mu.RUnlock()
 	if !ok || client == nil {
 		return fmt.Errorf("no active client for instance %s", instanceId)
 	}
@@ -3136,7 +3218,9 @@ func (w *whatsmeowService) SubmitPasskeyResponse(instanceId string, resp *types.
 // ConfirmPasskey finishes the pairing after the user verified the code.
 // Called by POST /passkey-ceremony/{token}/confirm.
 func (w *whatsmeowService) ConfirmPasskey(instanceId string) error {
+	client_registry.Mu.RLock()
 	client, ok := w.clientPointer[instanceId]
+	client_registry.Mu.RUnlock()
 	if !ok || client == nil {
 		return fmt.Errorf("no active client for instance %s", instanceId)
 	}

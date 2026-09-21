@@ -679,37 +679,18 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
 			}
 
-			postMap := make(map[string]interface{})
-
-			postMap["event"] = "LoggedOut"
-
-			dataMap := make(map[string]interface{})
-
-			dataMap["reason"] = "Logged out"
-
-			postMap["data"] = dataMap
-
-			postMap["instanceToken"] = mycli.token
-			postMap["instanceId"] = mycli.userID
-			postMap["instanceName"] = cd.Instance.Name
-
-			var queueName string
-
-			if _, ok := postMap["event"]; ok {
-				queueName = strings.ToLower(fmt.Sprintf("%s.%s", cd.Instance.Id, postMap["event"]))
-			}
-
-			values, err := json.Marshal(postMap)
-			if err != nil {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Failed to marshal JSON for queue", cd.Instance.Id)
-				return
-			}
-
-			go w.CallWebhook(cd.Instance, queueName, values)
-
-			if mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled {
-				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
-			}
+			// No synthetic "LoggedOut" webhook here. Every sender of this kill
+			// channel has already dispatched the REAL event for its situation:
+			//   - *events.LoggedOut handler → "LoggedOut" with the real reason
+			//     (e.g. "401: logged out from another device"), then `<- false`;
+			//   - teardownQR → "QRTimeout", then `<- false`;
+			//   - ReconnectClient (after a real "Disconnected"), the disconnect /
+			//     force-reconnect / clear-cache paths → `<- true` (restart).
+			// Emitting "LoggedOut" for all of them was either a duplicate (real
+			// logout) or plain false (internal restart / QR timeout), and would
+			// make subscribers of CONNECTION believe the session died on every
+			// reconnect. The restart path now yields the correct sequence:
+			// Disconnected → Connected.
 
 			// 🔴 SÓ reinicia se o kill pediu restart (valor `true`). Logout 401 e timeout de QR
 			// mandam `false` — NÃO reiniciar: no logout o Store foi apagado, então o StartClient

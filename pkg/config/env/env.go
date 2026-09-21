@@ -51,6 +51,10 @@ const (
 	MEDIA_MAX_AUTODOWNLOAD_BYTES = "MEDIA_MAX_AUTODOWNLOAD_BYTES" // pula o auto-download acima de N bytes (0 = sem teto)
 	MEDIA_DOWNLOAD_CONCURRENCY   = "MEDIA_DOWNLOAD_CONCURRENCY"   // máx. downloads simultâneos no processo (0 = ilimitado)
 
+	// Outbox durável de webhook (ver pkg/events/webhook/outbox_*). Nasce INERTE: vazio/false = comportamento
+	// antigo (fire-and-retry em memória). "true" liga a fila write-ahead no Postgres + worker de drain.
+	WEBHOOK_OUTBOX_ENABLED = "WEBHOOK_OUTBOX_ENABLED"
+
 	// Logger configurations
 	LOG_MAX_SIZE    = "LOG_MAX_SIZE"
 	LOG_MAX_BACKUPS = "LOG_MAX_BACKUPS"

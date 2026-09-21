@@ -66,6 +66,9 @@ type Config struct {
 	MediaMaxAutoDownloadBytes int64
 	MediaDownloadConcurrency  int
 
+	// Outbox durável de webhook (pkg/events/webhook). false = inerte (fire-and-retry em memória, comportamento antigo).
+	WebhookOutboxEnabled bool
+
 	// Logger configurations
 	LogMaxSize    int
 	LogMaxBackups int
@@ -313,6 +316,12 @@ func Load() *Config {
 		mediaDownloadConcurrency, _ = strconv.Atoi(v)
 	}
 
+	// Outbox de webhook — inerte por padrão; só "true"/"enabled" liga.
+	webhookOutboxEnabled := false
+	if v := os.Getenv(config_env.WEBHOOK_OUTBOX_ENABLED); v == "true" || v == "enabled" || v == "1" {
+		webhookOutboxEnabled = true
+	}
+
 	amqpGlobalEvents := strings.Split(os.Getenv(config_env.AMQP_GLOBAL_EVENTS), ",")
 	if len(amqpGlobalEvents) == 1 && amqpGlobalEvents[0] == "" {
 		amqpGlobalEvents = []string{}
@@ -392,6 +401,7 @@ func Load() *Config {
 
 		MediaMaxAutoDownloadBytes: mediaMaxAutoDownloadBytes,
 		MediaDownloadConcurrency:  mediaDownloadConcurrency,
+		WebhookOutboxEnabled:      webhookOutboxEnabled,
 		AmqpGlobalEvents:          amqpGlobalEvents,
 		AmqpSpecificEvents:        amqpSpecificEvents,
 		NatsUrl:                   natsUrl,

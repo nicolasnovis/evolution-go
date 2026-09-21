@@ -131,7 +131,13 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 		)
 	}
 
-	webhookProducer := webhook_producer.NewWebhookProducer(config.WebhookUrl, loggerWrapper)
+	// Outbox durável de webhook (kill-switch OFF por padrão → outboxRepo nil = comportamento antigo).
+	var outboxRepo *webhook_producer.OutboxRepository
+	if config.WebhookOutboxEnabled {
+		outboxRepo = webhook_producer.NewOutboxRepository(db)
+		logger.LogInfo("Webhook outbox habilitado")
+	}
+	webhookProducer := webhook_producer.NewWebhookProducer(config.WebhookUrl, loggerWrapper, outboxRepo)
 	websocketProducer := websocket_producer.NewWebsocketProducer(loggerWrapper)
 
 	// Cria filas globais se o RabbitMQ global estiver habilitado
@@ -163,6 +169,20 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	instanceRepository := instance_repository.NewInstanceRepository(db)
 	messageRepository := message_repository.NewMessageRepository(db)
 	labelRepository := label_repository.NewLabelRepository(db)
+
+	// Worker de drain do outbox — só quando ligado. resolveURL busca o webhook ATUAL da instância a cada
+	// tentativa (troca de webhook/domínio vale; teste T2 funciona). context.Background: vive todo o processo;
+	// as linhas pending sobrevivem a restart no PG, então não precisa de shutdown gracioso.
+	if outboxRepo != nil {
+		resolveURL := func(instanceID string) (string, bool) {
+			inst, err := instanceRepository.GetInstanceByID(instanceID)
+			if err != nil || inst == nil {
+				return "", false
+			}
+			return inst.Webhook, true
+		}
+		webhook_producer.StartOutboxWorker(context.Background(), outboxRepo, resolveURL, loggerWrapper)
+	}
 
 	whatsmeowService := whatsmeow_service.NewWhatsmeowService(
 		instanceRepository,
@@ -373,6 +393,13 @@ func main() {
 	}
 
 	migrate(db)
+
+	// Tabela do outbox de webhook — só quando ligado (fica inerte se o env não estiver setado).
+	if cfg.WebhookOutboxEnabled {
+		if err := db.AutoMigrate(&webhook_producer.WebhookOutbox{}); err != nil {
+			log.Fatal("Failed to migrate webhook_outbox: ", err)
+		}
+	}
 
 	// Initialize core DB + license runtime
 	core.SetDB(db)

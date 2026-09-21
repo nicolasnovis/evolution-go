@@ -11,6 +11,7 @@ import (
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
+	"github.com/evolution-foundation/evolution-go/pkg/mediaguard"
 	message_model "github.com/evolution-foundation/evolution-go/pkg/message/model"
 	message_repository "github.com/evolution-foundation/evolution-go/pkg/message/repository"
 	"github.com/evolution-foundation/evolution-go/pkg/utils"
@@ -431,6 +432,19 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 		return nil, "", errors.New("invalid media type")
 	}
 
+	// Contexto da REQUEST: quando o app desiste (timeout de 15/30 s), o download cancela na hora em vez
+	// de o engine continuar baixando à toa (era context.Background = nunca cancelava). Semáforo GLOBAL
+	// (pkg/mediaguard) segura o pico de RAM de vários downloads simultâneos. Ambos inertes por default.
+	ctx := context.Background()
+	if request != nil {
+		ctx = request.Context()
+	}
+	release, err := mediaguard.Acquire(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	defer release()
+
 	userDirectory := fmt.Sprintf(`files/user_%s`, instance.Id)
 	_, err = os.Stat(userDirectory)
 	if os.IsNotExist(err) {
@@ -442,7 +456,7 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 	}
 
 	if img != nil {
-		mediaData, err = client.Download(context.Background(), img)
+		mediaData, err = client.Download(ctx, img)
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download image", instance.Id)
 			msg := fmt.Sprintf("Failed to download image %v", err)
@@ -452,7 +466,7 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 	}
 
 	if audio != nil {
-		mediaData, err = client.Download(context.Background(), audio)
+		mediaData, err = client.Download(ctx, audio)
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download audio", instance.Id)
 			msg := fmt.Sprintf("Failed to download audio %v", err)
@@ -462,7 +476,7 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 	}
 
 	if document != nil {
-		mediaData, err = client.Download(context.Background(), document)
+		mediaData, err = client.Download(ctx, document)
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download document", instance.Id)
 			msg := fmt.Sprintf("Failed to download document %v", err)
@@ -472,7 +486,7 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 	}
 
 	if video != nil {
-		mediaData, err = client.Download(context.Background(), video)
+		mediaData, err = client.Download(ctx, video)
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download video", instance.Id)
 			msg := fmt.Sprintf("Failed to download video %v", err)
@@ -482,7 +496,7 @@ func (m *messageService) DownloadMedia(data *DownloadMediaStruct, instance *inst
 	}
 
 	if sticker != nil {
-		mediaData, err = client.Download(context.Background(), sticker)
+		mediaData, err = client.Download(ctx, sticker)
 		if err != nil {
 			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Failed to download sticker", instance.Id)
 			msg := fmt.Sprintf("Failed to download sticker %v", err)

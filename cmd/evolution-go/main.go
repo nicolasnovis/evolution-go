@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof" // registra o profiler no DefaultServeMux — servido só em 127.0.0.1:6060 (ver main)
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -45,6 +46,7 @@ import (
 	label_repository "github.com/evolution-foundation/evolution-go/pkg/label/repository"
 	label_service "github.com/evolution-foundation/evolution-go/pkg/label/service"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
+	"github.com/evolution-foundation/evolution-go/pkg/mediaguard"
 	message_handler "github.com/evolution-foundation/evolution-go/pkg/message/handler"
 	message_model "github.com/evolution-foundation/evolution-go/pkg/message/model"
 	message_repository "github.com/evolution-foundation/evolution-go/pkg/message/repository"
@@ -340,6 +342,9 @@ func main() {
 
 	cfg := config.Load()
 
+	// Freios de memória do download de mídia (pkg/mediaguard) — inertes até serem ligados por env.
+	mediaguard.Init(cfg.MediaDownloadConcurrency, cfg.MediaMaxAutoDownloadBytes)
+
 	logger.LogInfo("Starting Evolution GO version %s", version)
 
 	startTime := time.Now()
@@ -420,6 +425,15 @@ func main() {
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// pprof só em loopback (127.0.0.1:6060) — nunca exposto fora do container. Coletar heap:
+	// `docker exec <ctr> wget -qO- http://127.0.0.1:6060/debug/pprof/heap > /tmp/heap` (ou publicar a
+	// porta no compose). Serve o net/http/pprof registrado no DefaultServeMux pelo import _ acima.
+	go func() {
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+			log.Printf("pprof indisponível: %v", err)
+		}
+	}()
 
 	go func() {
 		logger.LogInfo("Iniciando servidor na porta %s", os.Getenv("SERVER_PORT"))

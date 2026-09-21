@@ -46,6 +46,11 @@ const (
 	QRCODE_MAX_COUNT        = "QRCODE_MAX_COUNT"
 	CHECK_USER_EXISTS       = "CHECK_USER_EXISTS"
 
+	// Freios de memória do download de mídia (ver pkg/mediaguard). Ambos nascem INERTES: 0/vazio =
+	// comportamento antigo. Ligar por env, sem rebuild.
+	MEDIA_MAX_AUTODOWNLOAD_BYTES = "MEDIA_MAX_AUTODOWNLOAD_BYTES" // pula o auto-download acima de N bytes (0 = sem teto)
+	MEDIA_DOWNLOAD_CONCURRENCY   = "MEDIA_DOWNLOAD_CONCURRENCY"   // máx. downloads simultâneos no processo (0 = ilimitado)
+
 	// Logger configurations
 	LOG_MAX_SIZE    = "LOG_MAX_SIZE"
 	LOG_MAX_BACKUPS = "LOG_MAX_BACKUPS"

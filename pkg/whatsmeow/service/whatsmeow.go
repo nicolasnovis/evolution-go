@@ -45,6 +45,7 @@ import (
 	label_model "github.com/evolution-foundation/evolution-go/pkg/label/model"
 	label_repository "github.com/evolution-foundation/evolution-go/pkg/label/repository"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
+	"github.com/evolution-foundation/evolution-go/pkg/mediaguard"
 	message_model "github.com/evolution-foundation/evolution-go/pkg/message/model"
 	message_repository "github.com/evolution-foundation/evolution-go/pkg/message/repository"
 	"github.com/evolution-foundation/evolution-go/pkg/passkey/ceremony"
@@ -1043,6 +1044,22 @@ func (mycli *MyClient) escalatePoison(name appstate.WAPatchName, syncErr error) 
 	log.LogWarn("[%s] app-state %s ENVENENADO — recovery request enviado ao primário (issue #858, snapshot não-criptografado); aguardando a cura. Se não vier, cai pra reset-appstate + QR", mycli.userID, name)
 }
 
+// mediaDeclaredSize devolve o maior fileLength declarado entre as mídias não-nulas (bytes), lido do
+// proto ANTES de baixar — pro teto de auto-download do mediaguard. Os getters do proto tratam receiver
+// nil (devolvem 0), então passar um ponteiro nil é seguro. 0 = tamanho desconhecido/sem mídia.
+func mediaDeclaredSize(protos ...interface{ GetFileLength() uint64 }) int64 {
+	var maxLen int64
+	for _, p := range protos {
+		if p == nil {
+			continue
+		}
+		if n := int64(p.GetFileLength()); n > maxLen {
+			maxLen = n
+		}
+	}
+	return maxLen
+}
+
 func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	userID := mycli.userID
 	postMap := make(map[string]interface{})
@@ -1683,112 +1700,128 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 				downloadStart := time.Now()
 
-				// Handle regular media messages
-				if img != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading image - ID: %s", mycli.userID, evt.Info.ID)
-					data, err = mycli.WAClient.Download(downloadCtx, img)
-					extension = ".jpg"
-					mimeType = "image/jpeg"
-					if img.FileLength != nil {
-						mediaSize = int64(*img.FileLength)
-					}
-				} else if audio != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading audio - ID: %s", mycli.userID, evt.Info.ID)
-					data, err = mycli.WAClient.Download(downloadCtx, audio)
-					extension = ".ogg"
-					mimeType = "audio/ogg"
-					if audio.FileLength != nil {
-						mediaSize = int64(*audio.FileLength)
-					}
-				} else if document != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading document - ID: %s, FileName: %s, Size: %d bytes", mycli.userID, evt.Info.ID, document.GetFileName(), document.GetFileLength())
-					data, err = mycli.WAClient.Download(downloadCtx, document)
-					extension = getExtensionFromMimeType(document.GetMimetype())
-					mimeType = document.GetMimetype()
-					if document.FileLength != nil {
-						mediaSize = int64(*document.FileLength)
-					}
-				} else if video != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading video - ID: %s, Size: %d bytes", mycli.userID, evt.Info.ID, video.GetFileLength())
-					data, err = mycli.WAClient.Download(downloadCtx, video)
-					extension = ".mp4"
-					mimeType = "video/mp4"
-					if video.FileLength != nil {
-						mediaSize = int64(*video.FileLength)
-					}
-				} else if sticker != nil {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading sticker - ID: %s", mycli.userID, evt.Info.ID)
-					data, err = mycli.WAClient.Download(downloadCtx, sticker)
-					extension = ".png"
-					mimeType = "image/png"
-					if sticker.FileLength != nil {
-						mediaSize = int64(*sticker.FileLength)
-					}
-
-					if err == nil {
-						webpReader := bytes.NewReader(data)
-						img, decErr := webp.Decode(webpReader)
-						if decErr != nil {
-							mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to decode webp sticker, keeping raw webp: %v", mycli.userID, decErr)
-							extension = ".webp"
-							mimeType = "image/webp"
-						} else {
-							var pngBuffer bytes.Buffer
-							if encErr := png.Encode(&pngBuffer, img); encErr != nil {
-								mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to encode png from sticker, keeping raw webp: %v", mycli.userID, encErr)
-								extension = ".webp"
-								mimeType = "image/webp"
-							} else {
-								data = pngBuffer.Bytes()
-							}
-						}
-					}
-					// Handle associated child media messages
-				} else if associatedImg != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedImg)
-					extension = ".jpg"
-					mimeType = "image/jpeg"
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child image message", mycli.userID)
-				} else if associatedAudio != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedAudio)
-					extension = ".ogg"
-					mimeType = "audio/ogg"
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child audio message", mycli.userID)
-				} else if associatedDocument != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedDocument)
-					extension = getExtensionFromMimeType(associatedDocument.GetMimetype())
-					mimeType = associatedDocument.GetMimetype()
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child document message", mycli.userID)
-				} else if associatedVideo != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedVideo)
-					extension = ".mp4"
-					mimeType = "video/mp4"
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child video message", mycli.userID)
-				} else if associatedSticker != nil {
-					data, err = mycli.WAClient.Download(context.Background(), associatedSticker)
-					extension = ".png"
-					mimeType = "image/png"
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child sticker message", mycli.userID)
-
-					if err == nil {
-						webpReader := bytes.NewReader(data)
-						img, decErr := webp.Decode(webpReader)
-						if decErr != nil {
-							mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to decode webp sticker, keeping raw webp: %v", mycli.userID, decErr)
-							extension = ".webp"
-							mimeType = "image/webp"
-						} else {
-							var pngBuffer bytes.Buffer
-							if encErr := png.Encode(&pngBuffer, img); encErr != nil {
-								mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to encode png from associated sticker, keeping raw webp: %v", mycli.userID, encErr)
-								extension = ".webp"
-								mimeType = "image/webp"
-							} else {
-								data = pngBuffer.Bytes()
-							}
-						}
-					}
+				// Freio de memória (pkg/mediaguard): pula o auto-download da mídia acima do teto (os
+				// metadados do proto seguem no payload → o app materializa sob demanda), e um semáforo
+				// GLOBAL segura o pico de RAM de vários downloads simultâneos. Inertes por default.
+				declaredSize := mediaDeclaredSize(img, audio, document, video, sticker, associatedImg, associatedAudio, associatedDocument, associatedVideo, associatedSticker)
+				skipDownload := mediaguard.SkipAutoDownload(declaredSize)
+				if skipDownload {
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Auto-download PULADO (midia %d bytes acima do teto) - ID: %s", mycli.userID, declaredSize, evt.Info.ID)
+				} else if release, aerr := mediaguard.Acquire(downloadCtx); aerr != nil {
+					skipDownload = true
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Auto-download cancelado antes de baixar - ID: %s: %v", mycli.userID, evt.Info.ID, aerr)
+				} else {
+					defer release()
 				}
+
+				// Handle regular media messages
+				if !skipDownload {
+					if img != nil {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading image - ID: %s", mycli.userID, evt.Info.ID)
+						data, err = mycli.WAClient.Download(downloadCtx, img)
+						extension = ".jpg"
+						mimeType = "image/jpeg"
+						if img.FileLength != nil {
+							mediaSize = int64(*img.FileLength)
+						}
+					} else if audio != nil {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading audio - ID: %s", mycli.userID, evt.Info.ID)
+						data, err = mycli.WAClient.Download(downloadCtx, audio)
+						extension = ".ogg"
+						mimeType = "audio/ogg"
+						if audio.FileLength != nil {
+							mediaSize = int64(*audio.FileLength)
+						}
+					} else if document != nil {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading document - ID: %s, FileName: %s, Size: %d bytes", mycli.userID, evt.Info.ID, document.GetFileName(), document.GetFileLength())
+						data, err = mycli.WAClient.Download(downloadCtx, document)
+						extension = getExtensionFromMimeType(document.GetMimetype())
+						mimeType = document.GetMimetype()
+						if document.FileLength != nil {
+							mediaSize = int64(*document.FileLength)
+						}
+					} else if video != nil {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading video - ID: %s, Size: %d bytes", mycli.userID, evt.Info.ID, video.GetFileLength())
+						data, err = mycli.WAClient.Download(downloadCtx, video)
+						extension = ".mp4"
+						mimeType = "video/mp4"
+						if video.FileLength != nil {
+							mediaSize = int64(*video.FileLength)
+						}
+					} else if sticker != nil {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Downloading sticker - ID: %s", mycli.userID, evt.Info.ID)
+						data, err = mycli.WAClient.Download(downloadCtx, sticker)
+						extension = ".png"
+						mimeType = "image/png"
+						if sticker.FileLength != nil {
+							mediaSize = int64(*sticker.FileLength)
+						}
+
+						if err == nil {
+							webpReader := bytes.NewReader(data)
+							img, decErr := webp.Decode(webpReader)
+							if decErr != nil {
+								mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to decode webp sticker, keeping raw webp: %v", mycli.userID, decErr)
+								extension = ".webp"
+								mimeType = "image/webp"
+							} else {
+								var pngBuffer bytes.Buffer
+								if encErr := png.Encode(&pngBuffer, img); encErr != nil {
+									mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to encode png from sticker, keeping raw webp: %v", mycli.userID, encErr)
+									extension = ".webp"
+									mimeType = "image/webp"
+								} else {
+									data = pngBuffer.Bytes()
+								}
+							}
+						}
+						// Handle associated child media messages
+					} else if associatedImg != nil {
+						data, err = mycli.WAClient.Download(downloadCtx, associatedImg)
+						extension = ".jpg"
+						mimeType = "image/jpeg"
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child image message", mycli.userID)
+					} else if associatedAudio != nil {
+						data, err = mycli.WAClient.Download(downloadCtx, associatedAudio)
+						extension = ".ogg"
+						mimeType = "audio/ogg"
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child audio message", mycli.userID)
+					} else if associatedDocument != nil {
+						data, err = mycli.WAClient.Download(downloadCtx, associatedDocument)
+						extension = getExtensionFromMimeType(associatedDocument.GetMimetype())
+						mimeType = associatedDocument.GetMimetype()
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child document message", mycli.userID)
+					} else if associatedVideo != nil {
+						data, err = mycli.WAClient.Download(downloadCtx, associatedVideo)
+						extension = ".mp4"
+						mimeType = "video/mp4"
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child video message", mycli.userID)
+					} else if associatedSticker != nil {
+						data, err = mycli.WAClient.Download(downloadCtx, associatedSticker)
+						extension = ".png"
+						mimeType = "image/png"
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Processing associated child sticker message", mycli.userID)
+
+						if err == nil {
+							webpReader := bytes.NewReader(data)
+							img, decErr := webp.Decode(webpReader)
+							if decErr != nil {
+								mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to decode webp sticker, keeping raw webp: %v", mycli.userID, decErr)
+								extension = ".webp"
+								mimeType = "image/webp"
+							} else {
+								var pngBuffer bytes.Buffer
+								if encErr := png.Encode(&pngBuffer, img); encErr != nil {
+									mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Failed to encode png from associated sticker, keeping raw webp: %v", mycli.userID, encErr)
+									extension = ".webp"
+									mimeType = "image/webp"
+								} else {
+									data = pngBuffer.Bytes()
+								}
+							}
+						}
+					}
+				} // fecha o if !skipDownload
 
 				downloadDuration := time.Since(downloadStart)
 

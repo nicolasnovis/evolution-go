@@ -62,6 +62,10 @@ type Config struct {
 	QrcodeMaxCount       int
 	CheckUserExists      bool
 
+	// Freios de memória do download de mídia (pkg/mediaguard). 0 = inerte (comportamento antigo).
+	MediaMaxAutoDownloadBytes int64
+	MediaDownloadConcurrency  int
+
 	// Logger configurations
 	LogMaxSize    int
 	LogMaxBackups int
@@ -299,6 +303,16 @@ func Load() *Config {
 		qrMaxCount, _ = strconv.Atoi(qrcodeMaxCount)
 	}
 
+	// Freios de memória do download de mídia — 0/vazio = inerte (comportamento antigo).
+	mediaMaxAutoDownloadBytes := int64(0)
+	if v := os.Getenv(config_env.MEDIA_MAX_AUTODOWNLOAD_BYTES); v != "" {
+		mediaMaxAutoDownloadBytes, _ = strconv.ParseInt(v, 10, 64)
+	}
+	mediaDownloadConcurrency := 0
+	if v := os.Getenv(config_env.MEDIA_DOWNLOAD_CONCURRENCY); v != "" {
+		mediaDownloadConcurrency, _ = strconv.Atoi(v)
+	}
+
 	amqpGlobalEvents := strings.Split(os.Getenv(config_env.AMQP_GLOBAL_EVENTS), ",")
 	if len(amqpGlobalEvents) == 1 && amqpGlobalEvents[0] == "" {
 		amqpGlobalEvents = []string{}
@@ -375,16 +389,19 @@ func Load() *Config {
 		EventIgnoreStatus:    eventIgnoreStatus == "true",
 		QrcodeMaxCount:       qrMaxCount,
 		CheckUserExists:      checkUserExists != "false", // Default true, set to false to disable
-		AmqpGlobalEvents:     amqpGlobalEvents,
-		AmqpSpecificEvents:   amqpSpecificEvents,
-		NatsUrl:              natsUrl,
-		NatsGlobalEnabled:    natsGlobalEnabled == "true",
-		NatsGlobalEvents:     natsGlobalEvents,
-		LogMaxSize:           logMaxSize,
-		LogMaxBackups:        logMaxBackups,
-		LogMaxAge:            logMaxAge,
-		LogDirectory:         logDirectory,
-		LogCompress:          logCompress,
+
+		MediaMaxAutoDownloadBytes: mediaMaxAutoDownloadBytes,
+		MediaDownloadConcurrency:  mediaDownloadConcurrency,
+		AmqpGlobalEvents:          amqpGlobalEvents,
+		AmqpSpecificEvents:        amqpSpecificEvents,
+		NatsUrl:                   natsUrl,
+		NatsGlobalEnabled:         natsGlobalEnabled == "true",
+		NatsGlobalEvents:          natsGlobalEvents,
+		LogMaxSize:                logMaxSize,
+		LogMaxBackups:             logMaxBackups,
+		LogMaxAge:                 logMaxAge,
+		LogDirectory:              logDirectory,
+		LogCompress:               logCompress,
 	}
 
 	minioEnabled := os.Getenv(config_env.MINIO_ENABLED) == "true"

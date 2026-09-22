@@ -69,6 +69,10 @@ type Config struct {
 	// Outbox durável de webhook (pkg/events/webhook). false = inerte (fire-and-retry em memória, comportamento antigo).
 	WebhookOutboxEnabled bool
 
+	// Teto de bytes de UM webhook de HistorySync antes de fatiar (pkg/whatsmeow/service/history_sync_split).
+	// Default 3.500.000; vazio/0 cai no default. Threshold gigante desliga o fatiamento.
+	WebhookMaxPayloadBytes int
+
 	// Logger configurations
 	LogMaxSize    int
 	LogMaxBackups int
@@ -322,6 +326,15 @@ func Load() *Config {
 		webhookOutboxEnabled = true
 	}
 
+	// Teto do corpo de HistorySync antes de fatiar. Vazio/0/negativo → default 3.500.000 (ATIVO por padrão,
+	// deixa ~1MB de folga pro limite 4,5MB da Vercel). Pra desligar: threshold gigante ou swap reverso.
+	webhookMaxPayloadBytes := 3_500_000
+	if v := os.Getenv(config_env.WEBHOOK_MAX_PAYLOAD_BYTES); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			webhookMaxPayloadBytes = n
+		}
+	}
+
 	amqpGlobalEvents := strings.Split(os.Getenv(config_env.AMQP_GLOBAL_EVENTS), ",")
 	if len(amqpGlobalEvents) == 1 && amqpGlobalEvents[0] == "" {
 		amqpGlobalEvents = []string{}
@@ -402,6 +415,7 @@ func Load() *Config {
 		MediaMaxAutoDownloadBytes: mediaMaxAutoDownloadBytes,
 		MediaDownloadConcurrency:  mediaDownloadConcurrency,
 		WebhookOutboxEnabled:      webhookOutboxEnabled,
+		WebhookMaxPayloadBytes:    webhookMaxPayloadBytes,
 		AmqpGlobalEvents:          amqpGlobalEvents,
 		AmqpSpecificEvents:        amqpSpecificEvents,
 		NatsUrl:                   natsUrl,

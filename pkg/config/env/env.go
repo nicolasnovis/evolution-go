@@ -55,6 +55,12 @@ const (
 	// antigo (fire-and-retry em memória). "true" liga a fila write-ahead no Postgres + worker de drain.
 	WEBHOOK_OUTBOX_ENABLED = "WEBHOOK_OUTBOX_ENABLED"
 
+	// Teto de bytes do corpo de UM webhook de HistorySync (ver pkg/whatsmeow/service/history_sync_split).
+	// Acima disso o evento é fatiado em N chunks menores (subconjunto de Conversations por chunk) pra não
+	// estourar o limite de corpo da plataforma (413 na Vercel > 4,5MB). Vazio/0 = usa o default 3.500.000.
+	// Pra DESLIGAR o fatiamento: valor gigante (ex.: "999999999") ou swap reverso.
+	WEBHOOK_MAX_PAYLOAD_BYTES = "WEBHOOK_MAX_PAYLOAD_BYTES"
+
 	// Logger configurations
 	LOG_MAX_SIZE    = "LOG_MAX_SIZE"
 	LOG_MAX_BACKUPS = "LOG_MAX_BACKUPS"

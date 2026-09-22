@@ -29,6 +29,7 @@ import (
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -2417,12 +2418,6 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["instanceId"] = mycli.userID
 		postMap["instanceName"] = mycli.Instance.Name
 
-		values, err := json.Marshal(postMap)
-		if err != nil {
-			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to marshal JSON for queue", mycli.userID)
-			return
-		}
-
 		var queueName string
 		if _, ok := postMap["event"]; ok {
 			queueName = strings.ToLower(fmt.Sprintf("%s.%s", userID, postMap["event"]))
@@ -2432,6 +2427,25 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		eventType := "unknown"
 		if event, ok := postMap["event"].(string); ok {
 			eventType = event
+		}
+
+		// HistorySync fatiado: um único chunk grande estoura o limite de corpo da plataforma (413 na
+		// Vercel) e o reconciliador do Novi perde a conversa. Se o payload passa do teto, quebra em N
+		// eventos HistorySync menores e despacha EM ORDEM. O Novi já recebe dezenas de chunks por sync e
+		// é idempotente por chunk, então isso é transparente pra ele. Ver history_sync_split.go.
+		if maxBytes := mycli.config.WebhookMaxPayloadBytes; maxBytes > 0 {
+			if hs, ok := postMap["data"].(*events.HistorySync); ok && hs != nil && hs.Data != nil {
+				if parts := splitHistorySync(hs.Data, maxBytes); len(parts) > 1 {
+					mycli.dispatchHistorySyncChunks(postMap, hs, parts, queueName, eventType)
+					return
+				}
+			}
+		}
+
+		values, err := json.Marshal(postMap)
+		if err != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to marshal JSON for queue", mycli.userID)
+			return
 		}
 
 		dataSize := len(values)
@@ -2446,6 +2460,43 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 	} else {
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] ===== WEBHOOK SKIPPED ===== doWebhook=false", mycli.userID)
 	}
+}
+
+// dispatchHistorySyncChunks serializes each sliced HistorySync part into its own webhook envelope
+// (reusing the base envelope's identity fields, adding chunkIndex/chunkTotal) and delivers them IN
+// ORDER on a single goroutine, so a big HistorySync no longer trips the platform's body limit (413).
+// Marshaling happens here on the event-handler goroutine — same as the un-sliced path — while the
+// original proto data is still alive; only the HTTP sends are backgrounded.
+func (mycli *MyClient) dispatchHistorySyncChunks(base map[string]interface{}, orig *events.HistorySync, parts []*waHistorySync.HistorySync, queueName, eventType string) {
+	total := len(parts)
+	payloads := make([][]byte, 0, total)
+	for i, part := range parts {
+		chunk := make(map[string]interface{}, len(base)+2)
+		for k, v := range base {
+			chunk[k] = v
+		}
+		chunk["data"] = &events.HistorySync{Data: part, Notification: orig.Notification}
+		chunk["chunkIndex"] = i
+		chunk["chunkTotal"] = total
+
+		values, err := json.Marshal(chunk)
+		if err != nil {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Failed to marshal HistorySync chunk %d/%d: %v", mycli.userID, i+1, total, err)
+			continue
+		}
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] ===== DISPATCHING WEBHOOK ===== Event: %s (HistorySync chunk %d/%d), Queue: %s, DataSize: %d bytes", mycli.userID, eventType, i+1, total, queueName, len(values))
+		payloads = append(payloads, values)
+	}
+
+	sendGlobal := mycli.config.AmqpGlobalEnabled || mycli.config.NatsGlobalEnabled
+	go func() {
+		for _, values := range payloads {
+			mycli.service.CallWebhook(mycli.Instance, queueName, values)
+			if sendGlobal {
+				mycli.service.SendToGlobalQueues(eventType, values, mycli.userID)
+			}
+		}
+	}()
 }
 
 func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueName string, jsonData []byte) {

@@ -179,7 +179,18 @@ func formatBRNumber(jid string) string {
 
 	// Check if it's a mobile number (9 prefix) and DDD >= 31
 	if firstDigitNum >= 7 && dddNum >= 31 {
-		// Remove the 9 prefix for mobile numbers with DDD >= 31
+		// For DDD >= 31, WhatsApp historically canonicalizes mobiles WITHOUT the extra 9 — but ONLY
+		// the legacy ranges. Old 8-digit mobiles started with 6-9, so after the 9 was prepended their
+		// canonical form is "9" + [6-9]…; those WhatsApp keeps as 12 digits (strip the 9). Newer
+		// allocations are "9" + [0-5]… — they never had an 8-digit form and are registered WITH the 9
+		// (13 digits). Stripping THOSE produces a number that isn't on WhatsApp → "not registered" →
+		// the message never sends (bug hit for e.g. 31 9[2/3/5]… numbers). So only strip the legacy
+		// range; keep the 9 when the digit AFTER it is 0-5.
+		secondDigit, err := strconv.Atoi(jid[5:6])
+		if err == nil && secondDigit <= 5 {
+			return jid // new-range mobile (9 + 0-5…) — registered WITH the 9, keep it
+		}
+		// Remove the 9 prefix for legacy mobile numbers with DDD >= 31 (9 + 6-9…)
 		return jid[:4] + jid[5:]
 	}
 

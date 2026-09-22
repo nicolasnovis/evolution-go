@@ -227,6 +227,34 @@ func TestFormatBRNumber(t *testing.T) {
 			expected: "553187654321",
 		},
 		{
+			// Legacy range (9 + 6-9): WhatsApp keeps these as 12 digits → strip the 9. Fictitious numbers.
+			name:     "BR DDD>=31 legacy range (9+9) - strip the 9",
+			input:    "5531991234567",
+			expected: "553191234567",
+		},
+		{
+			// New range (9 + 0-5): registered WITH the 9 → keep. Fictitious numbers.
+			name:     "BR DDD>=31 new range (9+2) - keep the 9",
+			input:    "5531920001234",
+			expected: "5531920001234",
+		},
+		{
+			name:     "BR DDD>=31 new range (9+3) - keep the 9",
+			input:    "5531930001234",
+			expected: "5531930001234",
+		},
+		{
+			// Boundary: 9+5 keeps, 9+6 strips.
+			name:     "BR DDD>=31 new range boundary (9+5) - keep the 9",
+			input:    "5531950001234",
+			expected: "5531950001234",
+		},
+		{
+			name:     "BR DDD>=31 legacy boundary (9+6) - strip the 9",
+			input:    "5531960001234",
+			expected: "553160001234",
+		},
+		{
 			name:     "BR number with DDD < 31",
 			input:    "5521987654321",
 			expected: "5521987654321",

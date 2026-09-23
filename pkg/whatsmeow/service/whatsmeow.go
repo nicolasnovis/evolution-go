@@ -2433,10 +2433,20 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// Vercel) e o reconciliador do Novi perde a conversa. Se o payload passa do teto, quebra em N
 		// eventos HistorySync menores e despacha EM ORDEM. O Novi já recebe dezenas de chunks por sync e
 		// é idempotente por chunk, então isso é transparente pra ele. Ver history_sync_split.go.
+		// @lid → número ao lado do chunk (ver history_lid_map.go): sem isso o CRM descarta toda conversa
+		// @lid que ainda não conhece — metade ou mais de um histórico de pareamento.
+		var lidMap map[string]string
+		if hs, ok := postMap["data"].(*events.HistorySync); ok && hs != nil && hs.Data != nil {
+			lidMap = buildLIDMap(hs.Data, mycli.lookupPNForLID)
+			if len(lidMap) > 0 {
+				postMap["lidMap"] = lidMap
+			}
+		}
+
 		if maxBytes := mycli.config.WebhookMaxPayloadBytes; maxBytes > 0 {
 			if hs, ok := postMap["data"].(*events.HistorySync); ok && hs != nil && hs.Data != nil {
 				if parts := splitHistorySync(hs.Data, maxBytes); len(parts) > 1 {
-					mycli.dispatchHistorySyncChunks(postMap, hs, parts, queueName, eventType)
+					mycli.dispatchHistorySyncChunks(postMap, hs, parts, queueName, eventType, lidMap)
 					return
 				}
 			}
@@ -2467,7 +2477,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 // ORDER on a single goroutine, so a big HistorySync no longer trips the platform's body limit (413).
 // Marshaling happens here on the event-handler goroutine — same as the un-sliced path — while the
 // original proto data is still alive; only the HTTP sends are backgrounded.
-func (mycli *MyClient) dispatchHistorySyncChunks(base map[string]interface{}, orig *events.HistorySync, parts []*waHistorySync.HistorySync, queueName, eventType string) {
+func (mycli *MyClient) dispatchHistorySyncChunks(base map[string]interface{}, orig *events.HistorySync, parts []*waHistorySync.HistorySync, queueName, eventType string, lidMap map[string]string) {
 	total := len(parts)
 	payloads := make([][]byte, 0, total)
 	for i, part := range parts {
@@ -2478,6 +2488,11 @@ func (mycli *MyClient) dispatchHistorySyncChunks(base map[string]interface{}, or
 		chunk["data"] = &events.HistorySync{Data: part, Notification: orig.Notification}
 		chunk["chunkIndex"] = i
 		chunk["chunkTotal"] = total
+		// cada parte leva só os pares dos @lid dela (o base traz o mapa do chunk inteiro)
+		delete(chunk, "lidMap")
+		if m := lidMapForPart(lidMap, part); m != nil {
+			chunk["lidMap"] = m
+		}
 
 		values, err := json.Marshal(chunk)
 		if err != nil {
@@ -3310,4 +3325,20 @@ func cleanSenderID(senderID string) string {
 		}
 	}
 	return senderID
+}
+
+// lookupPNForLID consulta o mapa @lid → número acumulado no store do whatsmeow (última fonte do lidMap).
+func (mycli *MyClient) lookupPNForLID(lid string) (string, bool) {
+	if mycli.WAClient == nil || mycli.WAClient.Store == nil || mycli.WAClient.Store.LIDs == nil {
+		return "", false
+	}
+	jid, err := types.ParseJID(lid)
+	if err != nil {
+		return "", false
+	}
+	pn, err := mycli.WAClient.Store.LIDs.GetPNForLID(context.TODO(), jid)
+	if err != nil || pn.IsEmpty() {
+		return "", false
+	}
+	return pn.ToNonAD().String(), true
 }

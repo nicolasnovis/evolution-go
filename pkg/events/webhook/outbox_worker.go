@@ -14,7 +14,7 @@ const (
 	// pareando vira um fluxo contínuo e previsível pro CRM (e pro banco dele), em vez de uma rajada. Tick
 	// curto porque o gargalo é o tempo de ingestão de cada chunk, não o intervalo.
 	bulkTick      = 2 * time.Second
-	bulkBatch     = 20
+	bulkBatch     = 5
 	outboxGiveUp  = 48 * time.Hour // depois disso, um evento que nunca entregou vira dead
 	cleanupEvery  = time.Hour
 	keepDelivered = 24 * time.Hour     // `delivered` some 24h depois
@@ -49,6 +49,8 @@ type OutboxWorker struct {
 	resolveURL func(instanceID string) (string, bool) // webhook ATUAL da instância (resolvido a cada envio)
 	client     *httpSender
 	logger     *logger_wrapper.LoggerManager
+	// Teto de vazão da faixa bulk, em bytes/s (0 = sem teto). Ver paceFor.
+	bulkBytesPerSec int
 }
 
 func newOutboxWorker(
@@ -56,8 +58,28 @@ func newOutboxWorker(
 	resolveURL func(instanceID string) (string, bool),
 	client *httpSender,
 	logger *logger_wrapper.LoggerManager,
+	bulkBytesPerSec int,
 ) *OutboxWorker {
-	return &OutboxWorker{repo: repo, resolveURL: resolveURL, client: client, logger: logger}
+	return &OutboxWorker{repo: repo, resolveURL: resolveURL, client: client, logger: logger, bulkBytesPerSec: bulkBytesPerSec}
+}
+
+// paceFor diz quanto esperar DEPOIS de entregar um chunk de histórico pra faixa bulk não passar de
+// `bytesPerSec`: o chunk "custa" bytes/bytesPerSec segundos, descontado o tempo que o POST já levou.
+//
+// POR QUÊ (22/09, re-pareamento de uma conta com 200k mensagens): sem teto, a faixa entregava um chunk a
+// cada ~2s — ~150 mensagens/s gravadas no CRM. Cada linha gravada vira um evento do Realtime do Supabase,
+// que processa as mudanças do projeto numa fila ÚNICA (checando permissão de cada uma): o tempo real de
+// TODOS os tenants atrasou/perdeu evento — mensagem ao vivo sem aparecer na lista nem notificar. O
+// histórico continua vindo inteiro; só vem num ritmo que o tempo real aguenta.
+func paceFor(bytes, bytesPerSec int, elapsed time.Duration) time.Duration {
+	if bytesPerSec <= 0 || bytes <= 0 {
+		return 0
+	}
+	custo := time.Duration(float64(bytes) / float64(bytesPerSec) * float64(time.Second))
+	if custo <= elapsed {
+		return 0
+	}
+	return custo - elapsed
 }
 
 // StartOutboxWorker sobe o worker de drain numa goroutine. Entrypoint exportado pro main.go — esconde o
@@ -68,15 +90,16 @@ func StartOutboxWorker(
 	repo *OutboxRepository,
 	resolveURL func(instanceID string) (string, bool),
 	logger *logger_wrapper.LoggerManager,
+	bulkBytesPerSec int,
 ) {
-	w := newOutboxWorker(repo, resolveURL, newHTTPSender(logger), logger)
+	w := newOutboxWorker(repo, resolveURL, newHTTPSender(logger), logger, bulkBytesPerSec)
 	go w.Run(ctx)
 }
 
 // Run sobe um loop por faixa. As duas nunca disputam: o ao vivo segue com a latência de sempre enquanto o
 // bulk despeja histórico no ritmo que o CRM aguenta.
 func (w *OutboxWorker) Run(ctx context.Context) {
-	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s; histórico: tick %s, 1 em voo)", outboxTick, bulkTick)
+	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s; histórico: 1 em voo, teto %d bytes/s)", outboxTick, w.bulkBytesPerSec)
 	go w.runLane(ctx, LaneBulk, bulkTick, bulkBatch, false)
 	w.runLane(ctx, LaneLive, outboxTick, outboxBatch, true)
 }
@@ -135,6 +158,7 @@ func (w *OutboxWorker) drainOnce(ctx context.Context, lane string, batch int) {
 			continue
 		}
 
+		inicio := time.Now()
 		status, err := w.client.post(url, row.Payload, row.InstanceID)
 		switch classifyResult(status, err) {
 		case resultDelivered:
@@ -151,6 +175,17 @@ func (w *OutboxWorker) drainOnce(ctx context.Context, lane string, batch int) {
 				w.repo.Reschedule(row.ID, status, errText(err), time.Now().Add(backoffFor(row.Attempts+1)))
 			}
 			held[row.InstanceID] = true
+		}
+		// Cadência da faixa de histórico, DEPOIS de gravar o resultado (um restart no meio da espera não
+		// reentrega o que já foi). Vale pra sucesso E falha: re-tentar também grava no CRM.
+		if lane == LaneBulk {
+			if espera := paceFor(len(row.Payload), w.bulkBytesPerSec, time.Since(inicio)); espera > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(espera):
+				}
+			}
 		}
 	}
 }

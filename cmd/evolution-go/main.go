@@ -181,7 +181,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 			}
 			return inst.Webhook, true
 		}
-		webhook_producer.StartOutboxWorker(context.Background(), outboxRepo, resolveURL, loggerWrapper)
+		webhook_producer.StartOutboxWorker(context.Background(), outboxRepo, resolveURL, loggerWrapper, config.WebhookBulkBytesPerSec)
 	}
 
 	whatsmeowService := whatsmeow_service.NewWhatsmeowService(

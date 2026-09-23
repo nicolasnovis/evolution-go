@@ -76,6 +76,9 @@ type Config struct {
 	// Plataforma anunciada no pareamento ("CHROME" padrão; "DESKTOP" via PAIRING_PLATFORM).
 	PairingPlatform string
 
+	// Teto de vazão da faixa de histórico do outbox (bytes/s; 0 = sem teto). Default 50000.
+	WebhookBulkBytesPerSec int
+
 	// Logger configurations
 	LogMaxSize    int
 	LogMaxBackups int
@@ -338,6 +341,13 @@ func Load() *Config {
 		}
 	}
 
+	webhookBulkBytesPerSec := 50_000
+	if v := os.Getenv(config_env.WEBHOOK_BULK_BYTES_PER_SEC); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			webhookBulkBytesPerSec = n
+		}
+	}
+
 	// Só chrome/desktop são aceitos; qualquer outra coisa (inclusive vazio) fica no chrome de sempre.
 	pairingPlatform := "CHROME"
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(config_env.PAIRING_PLATFORM)), "desktop") {
@@ -426,6 +436,7 @@ func Load() *Config {
 		WebhookOutboxEnabled:      webhookOutboxEnabled,
 		WebhookMaxPayloadBytes:    webhookMaxPayloadBytes,
 		PairingPlatform:           pairingPlatform,
+		WebhookBulkBytesPerSec:    webhookBulkBytesPerSec,
 		AmqpGlobalEvents:          amqpGlobalEvents,
 		AmqpSpecificEvents:        amqpSpecificEvents,
 		NatsUrl:                   natsUrl,

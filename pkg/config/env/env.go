@@ -65,6 +65,10 @@ const (
 	// device — sessões já pareadas não mudam. Existe pra testar se desktop recebe mais histórico sem rebuild.
 	PAIRING_PLATFORM = "PAIRING_PLATFORM"
 
+	// Teto de vazão da faixa de HistorySync do outbox, em bytes/s (ver outbox_worker.paceFor). Vazio = default
+	// 50000 (~1 chunk de 1,5MB a cada 30s). "0" desliga o teto. Protege o tempo real do CRM de um despejo.
+	WEBHOOK_BULK_BYTES_PER_SEC = "WEBHOOK_BULK_BYTES_PER_SEC"
+
 	// Logger configurations
 	LOG_MAX_SIZE    = "LOG_MAX_SIZE"
 	LOG_MAX_BACKUPS = "LOG_MAX_BACKUPS"

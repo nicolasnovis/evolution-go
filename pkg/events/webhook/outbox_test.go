@@ -92,3 +92,25 @@ func TestLaneFor(t *testing.T) {
 		}
 	}
 }
+
+// O histórico entra num ritmo que o tempo real do CRM aguenta: o chunk "custa" bytes/teto segundos.
+func TestPaceFor(t *testing.T) {
+	cases := []struct {
+		name    string
+		bytes   int
+		rate    int
+		elapsed time.Duration
+		want    time.Duration
+	}{
+		{"1,5MB a 50KB/s = 30s", 1_500_000, 50_000, 0, 30 * time.Second},
+		{"desconta o tempo do POST", 1_500_000, 50_000, 4 * time.Second, 26 * time.Second},
+		{"POST mais lento que o teto → não espera", 100_000, 50_000, 5 * time.Second, 0},
+		{"sem teto (0) → não espera", 1_500_000, 0, 0, 0},
+		{"chunk vazio → não espera", 0, 50_000, 0, 0},
+	}
+	for _, c := range cases {
+		if got := paceFor(c.bytes, c.rate, c.elapsed); got != c.want {
+			t.Errorf("%s: paceFor = %s, quero %s", c.name, got, c.want)
+		}
+	}
+}

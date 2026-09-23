@@ -153,16 +153,22 @@ func (p *webhookProducer) enqueueAndTryImmediate(instanceID, event string, paylo
 		go p.sendWebhookWithRetry(url, payload, 5, 30*time.Second, instanceID)
 		return
 	}
+	// Histórico (faixa bulk) NUNCA vai na hora: o worker da faixa entrega um por vez, cadenciado. Um
+	// despejo de milhares de chunks não pode virar milhares de POSTs simultâneos no CRM.
+	lane := laneFor(event)
+	if lane == LaneBulk {
+		return
+	}
 	go func() {
-		// Se já há pendente mais antiga da mesma instância, não envia na hora — deixa o worker drenar em
-		// ordem de id (Receipt não passa na frente de Message).
-		if older, _ := p.outbox.HasOlderPending(instanceID, id); older {
+		// Se já há pendente mais antiga da mesma instância NA MESMA FAIXA, não envia na hora — deixa o
+		// worker drenar em ordem de id (Receipt não passa na frente de Message).
+		if older, _ := p.outbox.HasOlderPending(instanceID, id, lane); older {
 			return
 		}
 		status, sendErr := p.sender.post(url, payload, instanceID)
 		switch classifyResult(status, sendErr) {
 		case resultDelivered:
-			p.outbox.MarkDelivered(id, status)
+			p.outbox.MarkDelivered(id, status, false)
 			p.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] webhook entregue (outbox id=%d, status=%d)", instanceID, id, status)
 		case resultDead:
 			p.outbox.MarkDead(id, status, errText(sendErr))

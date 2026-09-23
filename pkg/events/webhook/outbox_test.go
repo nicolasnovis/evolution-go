@@ -80,3 +80,15 @@ func TestEventName(t *testing.T) {
 		t.Errorf("eventName de lixo = %q, quero vazio", got)
 	}
 }
+
+// Histórico vai pra faixa própria: um despejo de milhares de chunks não pode segurar a mensagem ao vivo.
+func TestLaneFor(t *testing.T) {
+	if got := laneFor("HistorySync"); got != LaneBulk {
+		t.Errorf("HistorySync deveria ir pra %q, foi pra %q", LaneBulk, got)
+	}
+	for _, e := range []string{"Message", "SendMessage", "Receipt", "Connected", "Disconnected", "LoggedOut", "OfflineSyncPreview", "OfflineSyncCompleted", "PollVote", ""} {
+		if got := laneFor(e); got != LaneLive {
+			t.Errorf("%q deveria ir pra %q, foi pra %q", e, LaneLive, got)
+		}
+	}
+}

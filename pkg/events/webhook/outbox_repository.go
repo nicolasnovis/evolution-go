@@ -21,6 +21,7 @@ func (r *OutboxRepository) Enqueue(instanceID, event string, payload []byte) (ui
 	row := WebhookOutbox{
 		InstanceID:    instanceID,
 		Event:         event,
+		Lane:          laneFor(event),
 		Payload:       payload,
 		Status:        OutboxPending,
 		Attempts:      0,
@@ -33,37 +34,49 @@ func (r *OutboxRepository) Enqueue(instanceID, event string, payload []byte) (ui
 	return row.ID, nil
 }
 
-// HasOlderPending diz se a instância tem alguma linha `pending` ANTERIOR a beforeID. Usado pela tentativa
-// imediata: se já há pendente mais antiga, não envia na hora (deixa o worker drenar em ordem por instância),
-// pra Receipt não passar na frente de Message.
-func (r *OutboxRepository) HasOlderPending(instanceID string, beforeID uint64) (bool, error) {
+// HasOlderPending diz se a instância tem alguma linha `pending` ANTERIOR a beforeID NA MESMA FAIXA. Usado
+// pela tentativa imediata: se já há pendente mais antiga, não envia na hora (deixa o worker drenar em ordem
+// por instância), pra Receipt não passar na frente de Message. Só olha a própria faixa: um histórico
+// pendente NÃO segura a mensagem ao vivo.
+func (r *OutboxRepository) HasOlderPending(instanceID string, beforeID uint64, lane string) (bool, error) {
 	var n int64
 	err := r.db.Model(&WebhookOutbox{}).
-		Where("instance_id = ? AND status = ? AND id < ?", instanceID, OutboxPending, beforeID).
+		Where("instance_id = ? AND lane = ? AND status = ? AND id < ?", instanceID, lane, OutboxPending, beforeID).
 		Count(&n).Error
 	return n > 0, err
 }
 
-// ClaimDue devolve até `limit` linhas pending vencidas, ORDENADAS por (instance_id, id) — o worker processa
-// cada instância em ordem de id.
-func (r *OutboxRepository) ClaimDue(limit int) ([]WebhookOutbox, error) {
+// ClaimDue devolve até `limit` linhas pending vencidas DE UMA FAIXA. Ao vivo sai ordenado por (instance_id,
+// id). Bulk sai por id (FIFO global): dois clientes pareando ao mesmo tempo dividem a vazão por ordem de
+// chegada, em vez de o de instance_id menor passar na frente do outro até terminar.
+func (r *OutboxRepository) ClaimDue(lane string, limit int) ([]WebhookOutbox, error) {
+	order := "instance_id asc, id asc"
+	if lane == LaneBulk {
+		order = "id asc"
+	}
 	var rows []WebhookOutbox
 	err := r.db.
-		Where("status = ? AND next_attempt_at <= ?", OutboxPending, time.Now()).
-		Order("instance_id asc, id asc").
+		Where("lane = ? AND status = ? AND next_attempt_at <= ?", lane, OutboxPending, time.Now()).
+		Order(order).
 		Limit(limit).
 		Find(&rows).Error
 	return rows, err
 }
 
-func (r *OutboxRepository) MarkDelivered(id uint64, status int) error {
+// MarkDelivered marca 2xx. dropPayload zera o corpo (faixa bulk): um histórico grande são GBs de JSON, e a
+// linha entregue só fica pra observabilidade — guardar o corpo 24h encheria o disco do VPS.
+func (r *OutboxRepository) MarkDelivered(id uint64, status int, dropPayload bool) error {
 	now := time.Now()
-	return r.db.Model(&WebhookOutbox{}).Where("id = ?", id).Updates(map[string]interface{}{
+	upd := map[string]interface{}{
 		"status":       OutboxDelivered,
 		"last_status":  status,
 		"last_error":   "",
 		"delivered_at": now,
-	}).Error
+	}
+	if dropPayload {
+		upd["payload"] = nil
+	}
+	return r.db.Model(&WebhookOutbox{}).Where("id = ?", id).Updates(upd).Error
 }
 
 // Reschedule incrementa attempts e adia a próxima tentativa (backoff), mantendo `pending`.

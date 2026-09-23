@@ -8,12 +8,17 @@ import (
 )
 
 const (
-	outboxTick     = 5 * time.Second
-	outboxBatch    = 200
-	outboxGiveUp   = 48 * time.Hour // depois disso, um evento que nunca entregou vira dead
-	cleanupEvery   = time.Hour
-	keepDelivered  = 24 * time.Hour   // `delivered` some 24h depois
-	keepDead       = 7 * 24 * time.Hour // `dead` some 7 dias depois
+	outboxTick  = 5 * time.Second
+	outboxBatch = 200
+	// Faixa bulk (HistorySync): UM chunk em voo por vez, somando TODOS os tenants. Um cliente grande
+	// pareando vira um fluxo contínuo e previsível pro CRM (e pro banco dele), em vez de uma rajada. Tick
+	// curto porque o gargalo é o tempo de ingestão de cada chunk, não o intervalo.
+	bulkTick      = 2 * time.Second
+	bulkBatch     = 20
+	outboxGiveUp  = 48 * time.Hour // depois disso, um evento que nunca entregou vira dead
+	cleanupEvery  = time.Hour
+	keepDelivered = 24 * time.Hour     // `delivered` some 24h depois
+	keepDead      = 7 * 24 * time.Hour // `dead` some 7 dias depois
 )
 
 // backoffFor devolve o adiamento da PRÓXIMA tentativa a partir da contagem de tentativas já feitas.
@@ -68,21 +73,27 @@ func StartOutboxWorker(
 	go w.Run(ctx)
 }
 
+// Run sobe um loop por faixa. As duas nunca disputam: o ao vivo segue com a latência de sempre enquanto o
+// bulk despeja histórico no ritmo que o CRM aguenta.
 func (w *OutboxWorker) Run(ctx context.Context) {
-	tick := time.NewTicker(outboxTick)
+	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s; histórico: tick %s, 1 em voo)", outboxTick, bulkTick)
+	go w.runLane(ctx, LaneBulk, bulkTick, bulkBatch, false)
+	w.runLane(ctx, LaneLive, outboxTick, outboxBatch, true)
+}
+
+func (w *OutboxWorker) runLane(ctx context.Context, lane string, every time.Duration, batch int, doCleanup bool) {
+	tick := time.NewTicker(every)
 	defer tick.Stop()
 	lastCleanup := time.Now()
-
-	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (tick %s)", outboxTick)
 
 	for {
 		select {
 		case <-ctx.Done():
-			w.logger.GetLogger("outbox").LogInfo("[outbox] worker encerrado")
+			w.logger.GetLogger("outbox").LogInfo("[outbox] worker %s encerrado", lane)
 			return
 		case <-tick.C:
-			w.drainOnce()
-			if time.Since(lastCleanup) >= cleanupEvery {
+			w.drainOnce(ctx, lane, batch)
+			if doCleanup && time.Since(lastCleanup) >= cleanupEvery {
 				if n, err := w.repo.Cleanup(time.Now().Add(-keepDelivered), time.Now().Add(-keepDead)); err != nil {
 					w.logger.GetLogger("outbox").LogWarn("[outbox] cleanup falhou: %v", err)
 				} else if n > 0 {
@@ -94,22 +105,25 @@ func (w *OutboxWorker) Run(ctx context.Context) {
 	}
 }
 
-func (w *OutboxWorker) drainOnce() {
-	rows, err := w.repo.ClaimDue(outboxBatch)
+func (w *OutboxWorker) drainOnce(ctx context.Context, lane string, batch int) {
+	rows, err := w.repo.ClaimDue(lane, batch)
 	if err != nil {
-		w.logger.GetLogger("outbox").LogWarn("[outbox] claim falhou: %v", err)
+		w.logger.GetLogger("outbox").LogWarn("[outbox] claim %s falhou: %v", lane, err)
 		return
 	}
 	if len(rows) == 0 {
 		return
 	}
 
-	// Preserva ordem POR INSTÂNCIA: se uma linha da instância falha de forma retentável, as posteriores
-	// dela esperam o próximo ciclo (rows já vêm ordenadas por instance_id, id). Um `dead` NÃO segura a
-	// instância — um evento permanentemente inentregável (413) não pode travar a fila atrás dele.
+	// Preserva ordem POR INSTÂNCIA dentro da faixa: se uma linha da instância falha de forma retentável, as
+	// posteriores dela (na mesma faixa) esperam o próximo ciclo. Um `dead` NÃO segura a instância — um evento
+	// permanentemente inentregável (413) não pode travar a fila atrás dele.
 	held := make(map[string]bool)
 
 	for _, row := range rows {
+		if ctx.Err() != nil {
+			return
+		}
 		if held[row.InstanceID] {
 			continue
 		}
@@ -124,7 +138,7 @@ func (w *OutboxWorker) drainOnce() {
 		status, err := w.client.post(url, row.Payload, row.InstanceID)
 		switch classifyResult(status, err) {
 		case resultDelivered:
-			w.repo.MarkDelivered(row.ID, status)
+			w.repo.MarkDelivered(row.ID, status, row.Lane == LaneBulk)
 		case resultDead:
 			w.repo.MarkDead(row.ID, status, errText(err))
 			w.logger.GetLogger(row.InstanceID).LogWarn("[outbox] dead-letter %s status=%d event=%s id=%d", row.InstanceID, status, row.Event, row.ID)

@@ -61,6 +61,10 @@ const (
 	// Pra DESLIGAR o fatiamento: valor gigante (ex.: "999999999") ou swap reverso.
 	WEBHOOK_MAX_PAYLOAD_BYTES = "WEBHOOK_MAX_PAYLOAD_BYTES"
 
+	// Como o aparelho se apresenta no PAREAMENTO ("chrome" padrão, ou "desktop"). Só vai no registro do
+	// device — sessões já pareadas não mudam. Existe pra testar se desktop recebe mais histórico sem rebuild.
+	PAIRING_PLATFORM = "PAIRING_PLATFORM"
+
 	// Logger configurations
 	LOG_MAX_SIZE    = "LOG_MAX_SIZE"
 	LOG_MAX_BACKUPS = "LOG_MAX_BACKUPS"

@@ -73,6 +73,9 @@ type Config struct {
 	// Default 3.500.000; vazio/0 cai no default. Threshold gigante desliga o fatiamento.
 	WebhookMaxPayloadBytes int
 
+	// Plataforma anunciada no pareamento ("CHROME" padrão; "DESKTOP" via PAIRING_PLATFORM).
+	PairingPlatform string
+
 	// Logger configurations
 	LogMaxSize    int
 	LogMaxBackups int
@@ -335,6 +338,12 @@ func Load() *Config {
 		}
 	}
 
+	// Só chrome/desktop são aceitos; qualquer outra coisa (inclusive vazio) fica no chrome de sempre.
+	pairingPlatform := "CHROME"
+	if strings.EqualFold(strings.TrimSpace(os.Getenv(config_env.PAIRING_PLATFORM)), "desktop") {
+		pairingPlatform = "DESKTOP"
+	}
+
 	amqpGlobalEvents := strings.Split(os.Getenv(config_env.AMQP_GLOBAL_EVENTS), ",")
 	if len(amqpGlobalEvents) == 1 && amqpGlobalEvents[0] == "" {
 		amqpGlobalEvents = []string{}
@@ -416,6 +425,7 @@ func Load() *Config {
 		MediaDownloadConcurrency:  mediaDownloadConcurrency,
 		WebhookOutboxEnabled:      webhookOutboxEnabled,
 		WebhookMaxPayloadBytes:    webhookMaxPayloadBytes,
+		PairingPlatform:           pairingPlatform,
 		AmqpGlobalEvents:          amqpGlobalEvents,
 		AmqpSpecificEvents:        amqpSpecificEvents,
 		NatsUrl:                   natsUrl,

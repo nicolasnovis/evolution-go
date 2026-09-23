@@ -436,7 +436,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	var version clientVersion
 
-	platformID, ok := waCompanionReg.DeviceProps_PlatformType_value[strings.ToUpper("chrome")]
+	platform := w.config.PairingPlatform
+	if platform == "" {
+		platform = "CHROME"
+	}
+	platformID, ok := waCompanionReg.DeviceProps_PlatformType_value[platform]
 	if ok {
 		store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_PlatformType(platformID).Enum()
 	}
@@ -446,6 +450,7 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	store.DeviceProps.Os = &cd.Instance.OsName
 	store.DeviceProps.RequireFullSync = proto.Bool(true)
+	applyFullHistoryConfig(store.DeviceProps.HistorySyncConfig)
 
 	if w.config.WhatsappVersionMajor != 0 && w.config.WhatsappVersionMinor != 0 && w.config.WhatsappVersionPatch != 0 {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version to %d.%d.%d", cd.Instance.Id, w.config.WhatsappVersionMajor, w.config.WhatsappVersionMinor, w.config.WhatsappVersionPatch)

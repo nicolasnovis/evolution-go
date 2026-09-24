@@ -15,6 +15,7 @@ type ChatHandler interface {
 	ChatUnarchive(ctx *gin.Context)
 	ChatMute(ctx *gin.Context)
 	ChatUnmute(ctx *gin.Context)
+	DeleteMessageForMe(ctx *gin.Context)
 	RecoverAppState(ctx *gin.Context)
 	ResetAppState(ctx *gin.Context)
 	HistorySyncRequest(ctx *gin.Context)
@@ -380,4 +381,42 @@ func NewChatHandler(
 	return &chatHandler{
 		chatService: chatService,
 	}
+}
+
+// Delete a message for me (this account only, on every device)
+// @Summary Delete a message for me
+// @Description Deletes a message only for this account, on all linked devices (app state deleteMessageForMe)
+// @Tags Chat
+// @Accept json
+// @Produce json
+// @Param message body chat_service.DeleteForMeStruct true "Message"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /chat/delete-for-me [post]
+func (c *chatHandler) DeleteMessageForMe(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	var data *chat_service.DeleteForMeStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if data.Chat == "" || data.MessageID == "" || data.MessageTimestamp <= 0 {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "chat, messageId and messageTimestamp are required"})
+		return
+	}
+
+	if err := c.chatService.DeleteMessageForMe(data, instance); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success"})
 }

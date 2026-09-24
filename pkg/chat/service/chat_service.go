@@ -26,6 +26,7 @@ type ChatService interface {
 	ChatUnarchive(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatMute(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatUnmute(data *BodyStruct, instance *instance_model.Instance) (string, error)
+	DeleteMessageForMe(data *DeleteForMeStruct, instance *instance_model.Instance) error
 	RecoverAppState(instance *instance_model.Instance) error
 	ResetAppState(instance *instance_model.Instance) error
 	HistorySyncRequest(data *HistorySyncRequestStruct, instance *instance_model.Instance) (*whatsmeow.SendResponse, error)
@@ -51,6 +52,19 @@ type BodyStruct struct {
 	LastMessageID        string `json:"lastMessageId,omitempty"`
 	LastMessageFromMe    bool   `json:"lastMessageFromMe,omitempty"`
 	LastMessageTimestamp int64  `json:"lastMessageTimestamp,omitempty"` // unix seconds
+}
+
+// DeleteForMeStruct: "apagar para mim" vindo do CRM. A mensagem some deste número em TODOS os aparelhos
+// (celular incluso), sem apagar pra outra pessoa. MessageID é o ID do WhatsApp (stanza id); Sender só
+// importa em grupo, em mensagem de outra pessoa (o participante que mandou); MessageTimestamp é o horário
+// ORIGINAL da mensagem em unix seconds.
+type DeleteForMeStruct struct {
+	Chat             string `json:"chat"`
+	MessageID        string `json:"messageId"`
+	FromMe           bool   `json:"fromMe"`
+	Sender           string `json:"sender,omitempty"`
+	MessageTimestamp int64  `json:"messageTimestamp"`
+	DeleteMedia      bool   `json:"deleteMedia,omitempty"`
 }
 
 // sendAppStateResilient serializa a mutação de app-state (pin/arquivar) POR instância e deixa o
@@ -313,6 +327,37 @@ func (c *chatService) ChatUnarchive(data *BodyStruct, instance *instance_model.I
 	}
 
 	return ts.String(), nil
+}
+
+// DeleteMessageForMe: CRM→WA "apagar para mim". Mutation deleteMessageForMe no regular_high (mesma
+// coleção do star). O chat passa pelo resolveAppStateTarget pelo mesmo motivo do pin: o celular indexa
+// conversa 1:1 pelo LID, e a mutação por número não bate com a mensagem que ele exibe.
+func (c *chatService) DeleteMessageForMe(data *DeleteForMeStruct, instance *instance_model.Instance) error {
+	client, err := c.ensureClientConnected(instance.Id)
+	if err != nil {
+		return err
+	}
+	recipient, ok := utils.ParseJID(data.Chat)
+	if !ok {
+		return errors.New("invalid chat")
+	}
+	var sender types.JID
+	if data.Sender != "" {
+		if sj, ok := utils.ParseJID(data.Sender); ok {
+			sender = sj
+		}
+	}
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	if sender.IsEmpty() && !data.FromMe {
+		sender = target // 1:1 recebida: o remetente é o próprio chat → vira "0" no índice
+	}
+	ts := time.Unix(data.MessageTimestamp, 0)
+	err = c.sendAppStateResilient(client, appstate.BuildDeleteForMe(target, sender, data.MessageID, data.FromMe, data.DeleteMedia, ts), instance.Id)
+	if err != nil {
+		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error delete for me: %v", instance.Id, err)
+		return err
+	}
+	return nil
 }
 
 func (c *chatService) ChatMute(data *BodyStruct, instance *instance_model.Instance) (string, error) {

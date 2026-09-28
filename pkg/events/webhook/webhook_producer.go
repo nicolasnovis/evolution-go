@@ -134,9 +134,9 @@ func (p *webhookProducer) Produce(
 	}
 
 	// Webhook POR INSTÂNCIA → durável via outbox quando ligado; senão legado.
-	event := eventName(payload)
+	event, fromFullSync := eventMeta(payload)
 	if p.outbox != nil && durableEvent(event) {
-		p.enqueueAndTryImmediate(userID, event, payload, webhookUrl)
+		p.enqueueAndTryImmediate(userID, event, laneFor(event, fromFullSync), payload, webhookUrl)
 	} else {
 		go p.sendWebhookWithRetry(webhookUrl, payload, 5, 30*time.Second, userID)
 	}
@@ -145,18 +145,17 @@ func (p *webhookProducer) Produce(
 
 // enqueueAndTryImmediate grava a linha ANTES de tentar (write-ahead) e faz a entrega imediata pra não
 // regredir a latência do caminho saudável. O que falhar fica pending → o worker drena com backoff.
-func (p *webhookProducer) enqueueAndTryImmediate(instanceID, event string, payload []byte, url string) {
-	id, err := p.outbox.Enqueue(instanceID, event, payload)
+func (p *webhookProducer) enqueueAndTryImmediate(instanceID, event, lane string, payload []byte, url string) {
+	id, err := p.outbox.Enqueue(instanceID, event, lane, payload)
 	if err != nil {
 		// Não perde o evento: cai no envio legado (sem durabilidade, mas entrega).
 		p.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] outbox enqueue falhou (%v) — envio direto sem durabilidade", instanceID, err)
 		go p.sendWebhookWithRetry(url, payload, 5, 30*time.Second, instanceID)
 		return
 	}
-	// Histórico (faixa bulk) NUNCA vai na hora: o worker da faixa entrega um por vez, cadenciado. Um
-	// despejo de milhares de chunks não pode virar milhares de POSTs simultâneos no CRM.
-	lane := laneFor(event)
-	if lane == LaneBulk {
+	// Histórico (bulk) e app-state em massa (sync) NUNCA vão na hora: o worker da faixa entrega. Um despejo
+	// de milhares de eventos não pode virar milhares de POSTs (e de queries) simultâneos.
+	if lane != LaneLive {
 		return
 	}
 	go func() {
@@ -198,15 +197,23 @@ func (p *webhookProducer) sendWebhookWithRetry(url string, body []byte, maxRetri
 	p.loggerWrapper.GetLogger(userID).LogError("[%s] webhook failed after maximum retries - url: %s", userID, url)
 }
 
-// eventName lê só o campo "event" do envelope JSON.
-func eventName(payload []byte) string {
+// eventMeta lê do envelope JSON o campo "event" e, se houver, data.FromFullSync (app-state). O `data` vem
+// cru e é lido à parte: um data que não seja objeto não pode apagar o nome do evento.
+func eventMeta(payload []byte) (event string, fromFullSync bool) {
 	var env struct {
-		Event string `json:"event"`
+		Event string          `json:"event"`
+		Data  json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(payload, &env); err != nil {
-		return ""
+		return "", false
 	}
-	return env.Event
+	var data struct {
+		FromFullSync bool `json:"FromFullSync"`
+	}
+	if len(env.Data) > 0 && json.Unmarshal(env.Data, &data) == nil {
+		fromFullSync = data.FromFullSync
+	}
+	return env.Event, fromFullSync
 }
 
 // CreateGlobalQueues não faz nada para webhook producer

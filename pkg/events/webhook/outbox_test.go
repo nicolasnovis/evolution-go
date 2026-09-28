@@ -72,22 +72,41 @@ func TestBackoffFor(t *testing.T) {
 	}
 }
 
-func TestEventName(t *testing.T) {
-	if got := eventName([]byte(`{"event":"Message","data":{}}`)); got != "Message" {
-		t.Errorf("eventName = %q, quero Message", got)
+func TestEventMeta(t *testing.T) {
+	if ev, full := eventMeta([]byte(`{"event":"Message","data":{}}`)); ev != "Message" || full {
+		t.Errorf("eventMeta = %q/%v, quero Message/false", ev, full)
 	}
-	if got := eventName([]byte(`não é json`)); got != "" {
-		t.Errorf("eventName de lixo = %q, quero vazio", got)
+	if ev, full := eventMeta([]byte(`{"event":"Archive","data":{"FromFullSync":true}}`)); ev != "Archive" || !full {
+		t.Errorf("eventMeta = %q/%v, quero Archive/true", ev, full)
+	}
+	// data que não é objeto não pode apagar o nome do evento
+	if ev, full := eventMeta([]byte(`{"event":"Receipt","data":["x"]}`)); ev != "Receipt" || full {
+		t.Errorf("eventMeta com data não-objeto = %q/%v, quero Receipt/false", ev, full)
+	}
+	if ev, _ := eventMeta([]byte(`não é json`)); ev != "" {
+		t.Errorf("eventMeta de lixo = %q, quero vazio", ev)
 	}
 }
 
-// Histórico vai pra faixa própria: um despejo de milhares de chunks não pode segurar a mensagem ao vivo.
+// Histórico e app-state em massa vão pra faixas próprias: um despejo de milhares de eventos não pode
+// segurar a mensagem ao vivo.
 func TestLaneFor(t *testing.T) {
-	if got := laneFor("HistorySync"); got != LaneBulk {
+	if got := laneFor("HistorySync", false); got != LaneBulk {
 		t.Errorf("HistorySync deveria ir pra %q, foi pra %q", LaneBulk, got)
 	}
-	for _, e := range []string{"Message", "SendMessage", "Receipt", "Connected", "Disconnected", "LoggedOut", "OfflineSyncPreview", "OfflineSyncCompleted", "PollVote", ""} {
-		if got := laneFor(e); got != LaneLive {
+	if got := laneFor("Contact", false); got != LaneSync {
+		t.Errorf("Contact deveria ir pra %q, foi pra %q", LaneSync, got)
+	}
+	for _, e := range []string{"Archive", "Pin", "LabelAssociationChat", "DeleteForMe"} {
+		if got := laneFor(e, true); got != LaneSync {
+			t.Errorf("%q de full sync deveria ir pra %q, foi pra %q", e, LaneSync, got)
+		}
+		if got := laneFor(e, false); got != LaneLive {
+			t.Errorf("%q avulso deveria ir pra %q, foi pra %q", e, LaneLive, got)
+		}
+	}
+	for _, e := range []string{"Message", "SendMessage", "Receipt", "Connected", "Disconnected", "LoggedOut", "OfflineSyncPreview", "OfflineSyncCompleted", "PollVote", "PushName", ""} {
+		if got := laneFor(e, false); got != LaneLive {
 			t.Errorf("%q deveria ir pra %q, foi pra %q", e, LaneLive, got)
 		}
 	}

@@ -19,12 +19,22 @@ const (
 const (
 	LaneLive = "live" // mensagens, recibos, conexão… — latência importa
 	LaneBulk = "bulk" // HistorySync — volume alto, vazão cadenciada, nunca na frente do ao vivo
+	LaneSync = "sync" // app-state em massa (agenda, full sync) — volume alto, sem cadência, nunca na frente do ao vivo
 )
 
-// laneFor decide a faixa pelo tipo do evento.
-func laneFor(event string) string {
-	if event == "HistorySync" {
+// laneFor decide a faixa pelo tipo do evento e pela flag FromFullSync do app-state.
+//
+// POR QUÊ a faixa sync (28/09): o celular de UM cliente empurrou a agenda inteira via app-state — 3.041
+// eventos Contact em 2s, depois mais 3.044. Na faixa ao vivo eles ficaram na frente das mensagens e, com o
+// claim ordenado por instance_id, as instâncias "depois" dela ficaram ~20 min sem receber mensagem. Contact
+// só serve pro nome do contato no CRM (sem relação de ordem com Message), e um full sync de app-state
+// (arquivar/fixar/silenciar em massa, inclusive o que a nossa auto-cura dispara) tem o mesmo perfil.
+func laneFor(event string, fromFullSync bool) string {
+	switch {
+	case event == "HistorySync":
 		return LaneBulk
+	case event == "Contact", fromFullSync:
+		return LaneSync
 	}
 	return LaneLive
 }
@@ -41,12 +51,14 @@ func laneFor(event string) string {
 // OutboxWorker.resolveURL), pra troca de webhook/domínio valer e pro teste T2 (apontar pro buraco negro e
 // voltar) funcionar.
 type WebhookOutbox struct {
-	ID            uint64     `gorm:"primaryKey;autoIncrement"`
-	InstanceID    string     `gorm:"column:instance_id;index:idx_outbox_inst,priority:1"`
+	// idx_outbox_inst_pending cobre o HasOlderPending (instance_id, lane, status, id): sem ele, cada evento
+	// ao vivo fazia um count sequencial — na rajada de 28/09 foram 3 mil queries de 1–7s ao mesmo tempo.
+	ID            uint64     `gorm:"primaryKey;autoIncrement;index:idx_outbox_inst_pending,priority:4"`
+	InstanceID    string     `gorm:"column:instance_id;index:idx_outbox_inst,priority:1;index:idx_outbox_inst_pending,priority:1"`
 	Event         string     `gorm:"column:event"`
-	Lane          string     `gorm:"column:lane;not null;default:'live';index:idx_outbox_lane_due,priority:1"`
+	Lane          string     `gorm:"column:lane;not null;default:'live';index:idx_outbox_lane_due,priority:1;index:idx_outbox_inst_pending,priority:2"`
 	Payload       []byte     `gorm:"column:payload"` // o envelope JSON já serializado; na faixa bulk é zerado ao entregar
-	Status        string     `gorm:"column:status;index:idx_outbox_due,priority:1;index:idx_outbox_lane_due,priority:2"`
+	Status        string     `gorm:"column:status;index:idx_outbox_due,priority:1;index:idx_outbox_lane_due,priority:2;index:idx_outbox_inst_pending,priority:3"`
 	Attempts      int        `gorm:"column:attempts"`
 	NextAttemptAt time.Time  `gorm:"column:next_attempt_at;index:idx_outbox_due,priority:2;index:idx_outbox_lane_due,priority:3"`
 	LastStatus    int        `gorm:"column:last_status"` // último HTTP status observado (0 = erro de rede/timeout)

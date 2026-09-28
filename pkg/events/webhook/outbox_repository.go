@@ -16,12 +16,12 @@ func NewOutboxRepository(db *gorm.DB) *OutboxRepository {
 	return &OutboxRepository{db: db}
 }
 
-// Enqueue grava o evento como `pending` com next_attempt_at = agora (tentativa imediata logo em seguida).
-func (r *OutboxRepository) Enqueue(instanceID, event string, payload []byte) (uint64, error) {
+// Enqueue grava o evento como `pending` na faixa `lane` com next_attempt_at = agora.
+func (r *OutboxRepository) Enqueue(instanceID, event, lane string, payload []byte) (uint64, error) {
 	row := WebhookOutbox{
 		InstanceID:    instanceID,
 		Event:         event,
-		Lane:          laneFor(event),
+		Lane:          lane,
 		Payload:       payload,
 		Status:        OutboxPending,
 		Attempts:      0,
@@ -39,27 +39,44 @@ func (r *OutboxRepository) Enqueue(instanceID, event string, payload []byte) (ui
 // por instância), pra Receipt não passar na frente de Message. Só olha a própria faixa: um histórico
 // pendente NÃO segura a mensagem ao vivo.
 func (r *OutboxRepository) HasOlderPending(instanceID string, beforeID uint64, lane string) (bool, error) {
-	var n int64
+	// Existência (LIMIT 1), não count: só importa se há ALGUMA — com a instância atolada, contar tudo é caro.
+	var ids []uint64
 	err := r.db.Model(&WebhookOutbox{}).
 		Where("instance_id = ? AND lane = ? AND status = ? AND id < ?", instanceID, lane, OutboxPending, beforeID).
-		Count(&n).Error
-	return n > 0, err
+		Limit(1).
+		Pluck("id", &ids).Error
+	return len(ids) > 0, err
 }
 
-// ClaimDue devolve até `limit` linhas pending vencidas DE UMA FAIXA. Ao vivo sai ordenado por (instance_id,
-// id). Bulk sai por id (FIFO global): dois clientes pareando ao mesmo tempo dividem a vazão por ordem de
-// chegada, em vez de o de instance_id menor passar na frente do outro até terminar.
-func (r *OutboxRepository) ClaimDue(lane string, limit int) ([]WebhookOutbox, error) {
-	order := "instance_id asc, id asc"
-	if lane == LaneBulk {
-		order = "id asc"
-	}
+// ClaimDue devolve até `limit` linhas pending vencidas DE UMA FAIXA.
+//
+// Bulk sai por id (FIFO global): dois clientes pareando ao mesmo tempo dividem a vazão por ordem de chegada.
+//
+// Ao vivo e sync saem em RODÍZIO entre instâncias: no máximo `perInstance` linhas de cada, intercaladas (a
+// 1ª de cada instância, depois a 2ª de cada…), sempre em ordem de id dentro da instância.
+// POR QUÊ (28/09): o claim era `ORDER BY instance_id, id LIMIT 200` — uma instância com milhares de
+// pendentes enchia o lote sozinha e todas as de instance_id MAIOR ficavam fora de todos os ciclos até ela
+// esvaziar (~20 min sem mensagem nos clientes "depois" dela).
+func (r *OutboxRepository) ClaimDue(lane string, limit, perInstance int) ([]WebhookOutbox, error) {
 	var rows []WebhookOutbox
-	err := r.db.
-		Where("lane = ? AND status = ? AND next_attempt_at <= ?", lane, OutboxPending, time.Now()).
-		Order(order).
-		Limit(limit).
-		Find(&rows).Error
+	if lane == LaneBulk {
+		err := r.db.
+			Where("lane = ? AND status = ? AND next_attempt_at <= ?", lane, OutboxPending, time.Now()).
+			Order("id asc").
+			Limit(limit).
+			Find(&rows).Error
+		return rows, err
+	}
+	err := r.db.Raw(`
+		SELECT * FROM (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY instance_id ORDER BY id) AS rodada
+			FROM webhook_outbox
+			WHERE lane = ? AND status = ? AND next_attempt_at <= ?
+		) fila
+		WHERE rodada <= ?
+		ORDER BY rodada, id
+		LIMIT ?`, lane, OutboxPending, time.Now(), perInstance, limit).
+		Scan(&rows).Error
 	return rows, err
 }
 

@@ -10,6 +10,11 @@ import (
 const (
 	outboxTick  = 5 * time.Second
 	outboxBatch = 200
+	// Rodízio: por ciclo, no máximo isto de cada instância (ao vivo e sync). Ver OutboxRepository.ClaimDue.
+	perInstanceQuota = 20
+	// Faixa sync (app-state em massa): eventos pequenos, sem cadência; só não disputa com o ao vivo.
+	syncTick  = 2 * time.Second
+	syncBatch = 100
 	// Faixa bulk (HistorySync): UM chunk em voo por vez, somando TODOS os tenants. Um cliente grande
 	// pareando vira um fluxo contínuo e previsível pro CRM (e pro banco dele), em vez de uma rajada. Tick
 	// curto porque o gargalo é o tempo de ingestão de cada chunk, não o intervalo.
@@ -96,11 +101,12 @@ func StartOutboxWorker(
 	go w.Run(ctx)
 }
 
-// Run sobe um loop por faixa. As duas nunca disputam: o ao vivo segue com a latência de sempre enquanto o
+// Run sobe um loop por faixa. Elas nunca disputam: o ao vivo segue com a latência de sempre enquanto o
 // bulk despeja histórico no ritmo que o CRM aguenta.
 func (w *OutboxWorker) Run(ctx context.Context) {
-	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s; histórico: 1 em voo, teto %d bytes/s)", outboxTick, w.bulkBytesPerSec)
+	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s, rodízio %d/instância; sync: tick %s; histórico: 1 em voo, teto %d bytes/s)", outboxTick, perInstanceQuota, syncTick, w.bulkBytesPerSec)
 	go w.runLane(ctx, LaneBulk, bulkTick, bulkBatch, false)
+	go w.runLane(ctx, LaneSync, syncTick, syncBatch, false)
 	w.runLane(ctx, LaneLive, outboxTick, outboxBatch, true)
 }
 
@@ -129,7 +135,7 @@ func (w *OutboxWorker) runLane(ctx context.Context, lane string, every time.Dura
 }
 
 func (w *OutboxWorker) drainOnce(ctx context.Context, lane string, batch int) {
-	rows, err := w.repo.ClaimDue(lane, batch)
+	rows, err := w.repo.ClaimDue(lane, batch, perInstanceQuota)
 	if err != nil {
 		w.logger.GetLogger("outbox").LogWarn("[outbox] claim %s falhou: %v", lane, err)
 		return

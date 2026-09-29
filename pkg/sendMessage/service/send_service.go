@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
-	"image/png"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -2476,7 +2475,6 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 		}
 	}
 
-	isMedia := false
 
 	if data.Quoted.MessageID != "" {
 		switch messageType {
@@ -2492,28 +2490,24 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 				Participant:   proto.String(data.Quoted.Participant),
 				QuotedMessage: data.Quoted.QuotedMessage(),
 			}
-			isMedia = true
 		case "VideoMessage":
 			msg.VideoMessage.ContextInfo = &waE2E.ContextInfo{
 				StanzaID:      proto.String(data.Quoted.MessageID),
 				Participant:   proto.String(data.Quoted.Participant),
 				QuotedMessage: data.Quoted.QuotedMessage(),
 			}
-			isMedia = true
 		case "PtvMessage":
 			msg.PtvMessage.ContextInfo = &waE2E.ContextInfo{
 				StanzaID:      proto.String(data.Quoted.MessageID),
 				Participant:   proto.String(data.Quoted.Participant),
 				QuotedMessage: data.Quoted.QuotedMessage(),
 			}
-			isMedia = true
 		case "AudioMessage":
 			msg.AudioMessage.ContextInfo = &waE2E.ContextInfo{
 				StanzaID:      proto.String(data.Quoted.MessageID),
 				Participant:   proto.String(data.Quoted.Participant),
 				QuotedMessage: data.Quoted.QuotedMessage(),
 			}
-			isMedia = true
 		case "DocumentMessage":
 			if msg.DocumentMessage != nil {
 				msg.DocumentMessage.ContextInfo = &waE2E.ContextInfo{
@@ -2528,7 +2522,6 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 					QuotedMessage: data.Quoted.QuotedMessage(),
 				}
 			}
-			isMedia = true
 		case "PollCreationMessage":
 			msg.PollCreationMessage.ContextInfo = &waE2E.ContextInfo{
 				StanzaID:      proto.String(data.Quoted.MessageID),
@@ -2541,7 +2534,6 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 				Participant:   proto.String(data.Quoted.Participant),
 				QuotedMessage: data.Quoted.QuotedMessage(),
 			}
-			isMedia = true
 		case "LocationMessage":
 			msg.LocationMessage.ContextInfo = &waE2E.ContextInfo{
 				StanzaID:      proto.String(data.Quoted.MessageID),
@@ -2611,23 +2603,18 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 			msg.ExtendedTextMessage.ContextInfo = &waE2E.ContextInfo{}
 		case "ImageMessage":
 			msg.ImageMessage.ContextInfo = &waE2E.ContextInfo{}
-			isMedia = true
 		case "VideoMessage":
 			msg.VideoMessage.ContextInfo = &waE2E.ContextInfo{}
-			isMedia = true
 		case "PtvMessage":
 			msg.PtvMessage.ContextInfo = &waE2E.ContextInfo{}
-			isMedia = true
 		case "AudioMessage":
 			msg.AudioMessage.ContextInfo = &waE2E.ContextInfo{}
-			isMedia = true
 		case "DocumentMessage":
 			if msg.DocumentMessage != nil {
 				msg.DocumentMessage.ContextInfo = &waE2E.ContextInfo{}
 			} else if msg.DocumentWithCaptionMessage != nil {
 				msg.DocumentWithCaptionMessage.Message.DocumentMessage.ContextInfo = &waE2E.ContextInfo{}
 			}
-			isMedia = true
 		case "PollCreationMessage":
 			msg.PollCreationMessage.ContextInfo = &waE2E.ContextInfo{}
 		case "StickerMessage":
@@ -2916,51 +2903,11 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 
 	postMap["data"] = messageData
 
-	if isMedia && s.config.WebhookFiles {
-		var data []byte
-		var err error
-
-		img := msg.GetImageMessage()
-		audio := msg.GetAudioMessage()
-		document := msg.GetDocumentMessage()
-		video := msg.GetVideoMessage()
-		sticker := msg.GetStickerMessage()
-
-		if img != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), img)
-		} else if audio != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), audio)
-		} else if document != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), document)
-		} else if video != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), video)
-		} else if sticker != nil {
-			data, err = s.clientPointer[instance.Id].Download(context.Background(), sticker)
-
-			webpReader := bytes.NewReader(data)
-			img, err := webp.Decode(webpReader)
-			if err == nil {
-				var pngBuffer bytes.Buffer
-				err = png.Encode(&pngBuffer, img)
-				if err == nil {
-					data = pngBuffer.Bytes()
-				}
-			}
-		}
-
-		if err == nil {
-			// Acessando o Message do map já convertido
-			messageMap := msgMap
-			if messageMap == nil {
-				messageMap = make(map[string]interface{})
-			}
-
-			encodeData := base64.StdEncoding.EncodeToString(data)
-			messageMap["base64"] = encodeData
-
-			messageData["Message"] = messageMap
-		}
-	}
+	// SendMessage echo goes WITHOUT the media file (WebhookFiles is only for what we RECEIVE).
+	// Embedding it meant re-downloading what we had just uploaded and base64-ing it into the
+	// webhook: any file over ~3.3 MB became a >4.5 MB body the CRM host rejects (413), leaving
+	// a dead outbox row holding the whole video. The sender already has the file; the CRM
+	// fetches media on its own (/message/downloadmedia) when it needs it.
 
 	postMap["instanceToken"] = instance.Token
 	postMap["instanceId"] = instance.Id

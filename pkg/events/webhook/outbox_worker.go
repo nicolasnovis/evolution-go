@@ -2,14 +2,20 @@ package webhook_producer
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 )
 
 const (
-	outboxTick  = 5 * time.Second
+	// 1s: o worker é a REDE (evento cuja vez não chegou no envio imediato, retry). Com 5s, tudo que caía
+	// nele esperava até 5s + a fila das outras contas.
+	outboxTick  = time.Second
 	outboxBatch = 200
+	// Instâncias drenadas AO MESMO TEMPO por ciclo (dentro de cada uma, em ordem). Sequencial, uma conta
+	// com POST lento atrasava todas as outras do lote.
+	outboxParalelo = 8
 	// Rodízio: por ciclo, no máximo isto de cada instância (ao vivo e sync). Ver OutboxRepository.ClaimDue.
 	perInstanceQuota = 20
 	// Faixa sync (app-state em massa): eventos pequenos, sem cadência; só não disputa com o ao vivo.
@@ -104,7 +110,7 @@ func StartOutboxWorker(
 // Run sobe um loop por faixa. Elas nunca disputam: o ao vivo segue com a latência de sempre enquanto o
 // bulk despeja histórico no ritmo que o CRM aguenta.
 func (w *OutboxWorker) Run(ctx context.Context) {
-	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s, rodízio %d/instância; sync: tick %s; histórico: 1 em voo, teto %d bytes/s)", outboxTick, perInstanceQuota, syncTick, w.bulkBytesPerSec)
+	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s, rodízio %d/instância, %d instâncias em paralelo; sync: tick %s; histórico: 1 em voo, teto %d bytes/s)", outboxTick, perInstanceQuota, outboxParalelo, syncTick, w.bulkBytesPerSec)
 	go w.runLane(ctx, LaneBulk, bulkTick, bulkBatch, false)
 	go w.runLane(ctx, LaneSync, syncTick, syncBatch, false)
 	w.runLane(ctx, LaneLive, outboxTick, outboxBatch, true)
@@ -143,10 +149,41 @@ func (w *OutboxWorker) drainOnce(ctx context.Context, lane string, batch int) {
 	if len(rows) == 0 {
 		return
 	}
+	// Histórico: um em voo por vez, cadenciado (é o objetivo da faixa).
+	if lane == LaneBulk {
+		w.drenarInstancia(ctx, lane, rows)
+		return
+	}
 
-	// Preserva ordem POR INSTÂNCIA dentro da faixa: se uma linha da instância falha de forma retentável, as
-	// posteriores dela (na mesma faixa) esperam o próximo ciclo. Um `dead` NÃO segura a instância — um evento
-	// permanentemente inentregável (413) não pode travar a fila atrás dele.
+	// Ao vivo e sync: cada instância na sua goroutine (até outboxParalelo ao mesmo tempo), em ordem de id
+	// dentro dela. O ClaimDue já intercala as instâncias; aqui só se separa o que é de quem.
+	ordem := make([]string, 0)
+	porInstancia := make(map[string][]WebhookOutbox)
+	for _, r := range rows {
+		if _, ok := porInstancia[r.InstanceID]; !ok {
+			ordem = append(ordem, r.InstanceID)
+		}
+		porInstancia[r.InstanceID] = append(porInstancia[r.InstanceID], r)
+	}
+	vagas := make(chan struct{}, outboxParalelo)
+	var wg sync.WaitGroup
+	for _, inst := range ordem {
+		linhas := porInstancia[inst]
+		wg.Add(1)
+		vagas <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-vagas }()
+			w.drenarInstancia(ctx, lane, linhas)
+		}()
+	}
+	wg.Wait()
+}
+
+// drenarInstancia entrega linhas em ordem. Preserva a ordem POR INSTÂNCIA: se uma linha da instância falha
+// de forma retentável, as posteriores dela (na mesma faixa) esperam o próximo ciclo. Um `dead` NÃO segura a
+// instância — um evento permanentemente inentregável (413) não pode travar a fila atrás dele.
+func (w *OutboxWorker) drenarInstancia(ctx context.Context, lane string, rows []WebhookOutbox) {
 	held := make(map[string]bool)
 
 	for _, row := range rows {

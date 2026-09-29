@@ -16,8 +16,19 @@ func NewOutboxRepository(db *gorm.DB) *OutboxRepository {
 	return &OutboxRepository{db: db}
 }
 
-// Enqueue grava o evento como `pending` na faixa `lane` com next_attempt_at = agora.
+// reservaImediata — quanto tempo uma linha AO VIVO recém-gravada fica reservada pro envio imediato
+// (espera de vez + POST com teto de 30s). O worker não a vê nesse tempo, então os dois nunca entregam a
+// mesma linha. Se o envio imediato desistir, ele LIBERA a linha na hora (Liberar); a reserva só expira
+// sozinha se o processo morrer no meio — aí o worker assume depois dela.
+const reservaImediata = 40 * time.Second
+
+// Enqueue grava o evento como `pending` na faixa `lane`. Ao vivo nasce reservado pro envio imediato;
+// as outras faixas nascem vencidas (o worker é quem entrega).
 func (r *OutboxRepository) Enqueue(instanceID, event, lane string, payload []byte) (uint64, error) {
+	proxima := time.Now()
+	if lane == LaneLive {
+		proxima = proxima.Add(reservaImediata)
+	}
 	row := WebhookOutbox{
 		InstanceID:    instanceID,
 		Event:         event,
@@ -25,7 +36,7 @@ func (r *OutboxRepository) Enqueue(instanceID, event, lane string, payload []byt
 		Payload:       payload,
 		Status:        OutboxPending,
 		Attempts:      0,
-		NextAttemptAt: time.Now(),
+		NextAttemptAt: proxima,
 		CreatedAt:     time.Now(),
 	}
 	if err := r.db.Create(&row).Error; err != nil {
@@ -78,6 +89,12 @@ func (r *OutboxRepository) ClaimDue(lane string, limit, perInstance int) ([]Webh
 		LIMIT ?`, lane, OutboxPending, time.Now(), perInstance, limit).
 		Scan(&rows).Error
 	return rows, err
+}
+
+// Liberar tira a reserva do envio imediato: a linha fica vencida agora e o worker a entrega na ordem.
+func (r *OutboxRepository) Liberar(id uint64) error {
+	return r.db.Model(&WebhookOutbox{}).Where("id = ? AND status = ?", id, OutboxPending).
+		Update("next_attempt_at", time.Now()).Error
 }
 
 // MarkDelivered marca 2xx. dropPayload zera o corpo (faixa bulk): um histórico grande são GBs de JSON, e a

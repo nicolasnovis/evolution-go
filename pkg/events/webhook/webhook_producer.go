@@ -159,9 +159,14 @@ func (p *webhookProducer) enqueueAndTryImmediate(instanceID, event, lane string,
 		return
 	}
 	go func() {
-		// Se já há pendente mais antiga da mesma instância NA MESMA FAIXA, não envia na hora — deixa o
-		// worker drenar em ordem de id (Receipt não passa na frente de Message).
-		if older, _ := p.outbox.HasOlderPending(instanceID, id, lane); older {
+		// Ordem por instância: só envia quando não há pendente MAIS ANTIGA da mesma instância na faixa
+		// (Receipt não passa na frente de Message). Quase sempre a mais antiga é o envio imediato do evento
+		// anterior, ainda em voo — então ESPERA a vez um pouco em vez de desistir.
+		// POR QUÊ (29/09): desistir na hora mandava ~1/3 das mensagens pro worker (tick de 5s, fila de
+		// todas as contas) → 10–30s de "digitando…" no CRM com a mensagem já entregue no WhatsApp.
+		if !p.esperarVez(instanceID, id, lane) {
+			// a mais antiga está presa (retry/backoff) → o worker entrega na ordem, atrás dela
+			p.outbox.Liberar(id)
 			return
 		}
 		status, sendErr := p.sender.post(url, payload, instanceID)
@@ -177,6 +182,31 @@ func (p *webhookProducer) enqueueAndTryImmediate(instanceID, event, lane string,
 			p.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] webhook adiado p/ retry (outbox id=%d, status=%d): %v", instanceID, id, status, sendErr)
 		}
 	}()
+}
+
+// esperaDeVez — até quanto o envio imediato espera a pendente mais antiga da instância sair.
+const (
+	esperaDeVez      = 3 * time.Second
+	esperaDeVezPasso = 100 * time.Millisecond
+)
+
+// esperarVez devolve true quando não há mais pendente anterior da instância na faixa (pode enviar), ou
+// false se ela continuar lá depois da espera (falhou e está em backoff — quem entrega é o worker).
+func (p *webhookProducer) esperarVez(instanceID string, id uint64, lane string) bool {
+	limite := time.Now().Add(esperaDeVez)
+	for {
+		older, err := p.outbox.HasOlderPending(instanceID, id, lane)
+		if err != nil {
+			return false
+		}
+		if !older {
+			return true
+		}
+		if time.Now().After(limite) {
+			return false
+		}
+		time.Sleep(esperaDeVezPasso)
+	}
 }
 
 func (p *webhookProducer) sendWebhookWithRetry(url string, body []byte, maxRetries int, retryInterval time.Duration, userID string) {

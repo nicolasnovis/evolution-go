@@ -54,6 +54,12 @@ func TestOutboxLanesIntegration(t *testing.T) {
 	if older, _ := repo.HasOlderPending("A", msg, LaneLive); older {
 		t.Fatal("histórico pendente não pode segurar a mensagem ao vivo")
 	}
+	// linha ao vivo nasce RESERVADA pro envio imediato: o worker não a vê…
+	if cedo, _ := repo.ClaimDue(LaneLive, 10, 20); len(cedo) != 0 {
+		t.Fatalf("linha ao vivo reservada não pode aparecer pro worker, apareceram %d", len(cedo))
+	}
+	// …até o envio imediato desistir e liberar
+	repo.Liberar(msg)
 	// …e cada faixa só enxerga o que é dela
 	live, _ := repo.ClaimDue(LaneLive, 10, 20)
 	if len(live) != 1 || live[0].ID != msg {
@@ -101,6 +107,8 @@ func TestOutboxRodizioIntegration(t *testing.T) {
 	b1, _ := repo.Enqueue("b42a", "Message", LaneLive, []byte(`{}`))
 	b2, _ := repo.Enqueue("b42a", "Receipt", LaneLive, []byte(`{}`))
 	e1, _ := repo.Enqueue("ea6e", "Message", LaneLive, []byte(`{}`))
+	// simula o envio imediato tendo desistido de todas (o que as faz cair no worker)
+	db.Exec(`update webhook_outbox set next_attempt_at = now() where lane = 'live'`)
 
 	lote, err := repo.ClaimDue(LaneLive, 200, 20)
 	if err != nil {

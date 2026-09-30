@@ -2239,12 +2239,12 @@ func makeJPEGThumbnail(fileData []byte, maxWidth int) []byte {
 
 // pdfThumbWidth is the width (px) of the page-1 preview sent with PDF documents. The WhatsApp
 // client stretches the inline JPEGThumbnail to the full bubble width (~1000px on a phone), so
-// a small render (the old 200px @ q50) looks blurry next to documents sent from the official app.
-const pdfThumbWidth = 640
+// anything narrower than the real bubble (~1000 device px on a phone) gets upscaled and looks soft.
+const pdfThumbWidth = 1024
 
 // pdfThumbMaxBytes caps the inline thumbnail: it travels inside the (encrypted) message itself,
 // so it must stay small. Quality steps down until the JPEG fits.
-const pdfThumbMaxBytes = 60 * 1024
+const pdfThumbMaxBytes = 100 * 1024
 
 // makePDFThumbnail rasterizes the first page of a PDF into a JPEG preview thumbnail using the
 // external "pdftoppm" tool (poppler-utils), rendered directly at the target width (poppler

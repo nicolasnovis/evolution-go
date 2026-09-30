@@ -13,6 +13,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -1148,8 +1149,10 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 			// A missing pdftoppm or a failure yields nil and the document is
 			// sent without a preview instead of failing the request.
 			var jpegThumb []byte
+			var thumbW, thumbH, pageCount *uint32
 			if mimeType == "application/pdf" {
-				jpegThumb = makePDFThumbnail(fileData, 200)
+				jpegThumb, thumbW, thumbH = makePDFThumbnail(fileData, pdfThumbWidth)
+				pageCount = pdfPageCount(fileData)
 			}
 			if isNewsletter {
 				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
@@ -1160,7 +1163,10 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 					Mimetype:      proto.String(mimeType),
 					FileSHA256:    uploaded.FileSHA256,
 					FileLength:    &uploaded.FileLength,
-					JPEGThumbnail: jpegThumb,
+					JPEGThumbnail:   jpegThumb,
+					ThumbnailWidth:  thumbW,
+					ThumbnailHeight: thumbH,
+					PageCount:       pageCount,
 				}}
 			} else {
 				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
@@ -1173,7 +1179,10 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 					FileEncSHA256: uploaded.FileEncSHA256,
 					FileSHA256:    uploaded.FileSHA256,
 					FileLength:    proto.Uint64(uint64(len(fileData))),
-					JPEGThumbnail: jpegThumb,
+					JPEGThumbnail:   jpegThumb,
+					ThumbnailWidth:  thumbW,
+					ThumbnailHeight: thumbH,
+					PageCount:       pageCount,
 				}}
 			}
 
@@ -1470,8 +1479,10 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 			// A missing pdftoppm or a failure yields nil and the document is
 			// sent without a preview instead of failing the request.
 			var jpegThumb []byte
+			var thumbW, thumbH, pageCount *uint32
 			if mimeType == "application/pdf" {
-				jpegThumb = makePDFThumbnail(fileData, 200)
+				jpegThumb, thumbW, thumbH = makePDFThumbnail(fileData, pdfThumbWidth)
+				pageCount = pdfPageCount(fileData)
 			}
 			if isNewsletter {
 				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
@@ -1482,7 +1493,10 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 					Mimetype:      proto.String(mimeType),
 					FileSHA256:    uploaded.FileSHA256,
 					FileLength:    &uploaded.FileLength,
-					JPEGThumbnail: jpegThumb,
+					JPEGThumbnail:   jpegThumb,
+					ThumbnailWidth:  thumbW,
+					ThumbnailHeight: thumbH,
+					PageCount:       pageCount,
 				}}
 			} else {
 				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
@@ -1495,7 +1509,10 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 					FileEncSHA256: uploaded.FileEncSHA256,
 					FileSHA256:    uploaded.FileSHA256,
 					FileLength:    proto.Uint64(uint64(len(fileData))),
-					JPEGThumbnail: jpegThumb,
+					JPEGThumbnail:   jpegThumb,
+					ThumbnailWidth:  thumbW,
+					ThumbnailHeight: thumbH,
+					PageCount:       pageCount,
 				}}
 			}
 
@@ -2220,43 +2237,87 @@ func makeJPEGThumbnail(fileData []byte, maxWidth int) []byte {
 	return thumbBuf.Bytes()
 }
 
-// makePDFThumbnail rasterizes the first page of a PDF into a JPEG thumbnail
-// using the external "pdftoppm" tool (poppler-utils). It returns nil when
-// pdftoppm is not installed or rasterization fails, so callers can gracefully
-// send the document without a preview instead of failing the request.
-func makePDFThumbnail(fileData []byte, maxWidth int) []byte {
+// pdfThumbWidth is the width (px) of the page-1 preview sent with PDF documents. The WhatsApp
+// client stretches the inline JPEGThumbnail to the full bubble width (~1000px on a phone), so
+// a small render (the old 200px @ q50) looks blurry next to documents sent from the official app.
+const pdfThumbWidth = 640
+
+// pdfThumbMaxBytes caps the inline thumbnail: it travels inside the (encrypted) message itself,
+// so it must stay small. Quality steps down until the JPEG fits.
+const pdfThumbMaxBytes = 60 * 1024
+
+// makePDFThumbnail rasterizes the first page of a PDF into a JPEG preview thumbnail using the
+// external "pdftoppm" tool (poppler-utils), rendered directly at the target width (poppler
+// antialiases, so there is no second lossy resize). Returns the JPEG plus its dimensions, or
+// nils when pdftoppm is missing or fails, so the document is still sent (without a preview).
+func makePDFThumbnail(fileData []byte, width int) ([]byte, *uint32, *uint32) {
 	if _, err := exec.LookPath("pdftoppm"); err != nil {
+		return nil, nil, nil
+	}
+	if width < 1 {
+		width = pdfThumbWidth
+	}
+
+	for _, quality := range []int{85, 75, 65, 50} {
+		cmd := exec.Command("pdftoppm",
+			"-jpeg",
+			"-jpegopt", "quality="+strconv.Itoa(quality)+",optimize=y",
+			"-f", "1",
+			"-l", "1",
+			"-singlefile",
+			"-scale-to-x", strconv.Itoa(width),
+			"-scale-to-y", "-1",
+		)
+		cmd.Stdin = bytes.NewReader(fileData)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		if err := cmd.Run(); err != nil || out.Len() == 0 {
+			return nil, nil, nil
+		}
+		if out.Len() > pdfThumbMaxBytes && quality > 50 {
+			continue
+		}
+		cfg, err := jpeg.DecodeConfig(bytes.NewReader(out.Bytes()))
+		if err != nil {
+			return out.Bytes(), nil, nil
+		}
+		return out.Bytes(), proto.Uint32(uint32(cfg.Width)), proto.Uint32(uint32(cfg.Height))
+	}
+	return nil, nil, nil
+}
+
+var pdfPagesRe = regexp.MustCompile(`(?m)^Pages:\s+(\d+)`)
+
+// pdfPageCount reads the page count with "pdfinfo" (poppler-utils) so the bubble shows
+// "N páginas" like documents sent from the official app. nil when unknown.
+func pdfPageCount(fileData []byte) *uint32 {
+	if _, err := exec.LookPath("pdfinfo"); err != nil {
 		return nil
 	}
-
-	scaleWidth := maxWidth
-	if scaleWidth < 1 {
-		scaleWidth = 72
-	}
-
-	// Render only the first page to a PNG on stdout, scaled to scaleWidth.
-	// "-scale-to-y -1" keeps the original aspect ratio.
-	cmd := exec.Command("pdftoppm",
-		"-png",
-		"-f", "1",
-		"-l", "1",
-		"-singlefile",
-		"-scale-to-x", strconv.Itoa(scaleWidth),
-		"-scale-to-y", "-1",
-	)
-	cmd.Stdin = bytes.NewReader(fileData)
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
+	// pdfinfo does not read stdin: hand it a temp copy
+	tmp, err := os.CreateTemp("", "doc-*.pdf")
+	if err != nil {
 		return nil
 	}
-	if out.Len() == 0 {
+	defer os.Remove(tmp.Name())
+	_, werr := tmp.Write(fileData)
+	tmp.Close()
+	if werr != nil {
 		return nil
 	}
-
-	// Re-encode the rendered PNG as a JPEG thumbnail for consistency with images.
-	return makeJPEGThumbnail(out.Bytes(), maxWidth)
+	out, err := exec.Command("pdfinfo", tmp.Name()).Output()
+	if err != nil {
+		return nil
+	}
+	m := pdfPagesRe.FindSubmatch(out)
+	if m == nil {
+		return nil
+	}
+	n, err := strconv.Atoi(string(m[1]))
+	if err != nil || n < 1 {
+		return nil
+	}
+	return proto.Uint32(uint32(n))
 }
 
 func sectionsToString(data *ListStruct) (string, error) {

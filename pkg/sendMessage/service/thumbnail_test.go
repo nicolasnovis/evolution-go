@@ -95,10 +95,10 @@ func TestMakeJPEGThumbnail_DefaultsInvalidMaxWidth(t *testing.T) {
 func TestMakePDFThumbnail_InvalidInputReturnsNil(t *testing.T) {
 	// With or without pdftoppm installed, garbage input must never panic and
 	// must yield nil so the caller falls back to sending without a preview.
-	if thumb := makePDFThumbnail([]byte("%PDF-not-really"), 200); thumb != nil {
+	if thumb, _, _ := makePDFThumbnail([]byte("%PDF-not-really"), 200); thumb != nil {
 		t.Fatalf("expected nil for invalid PDF input, got %d bytes", len(thumb))
 	}
-	if thumb := makePDFThumbnail(nil, 200); thumb != nil {
+	if thumb, _, _ := makePDFThumbnail(nil, 200); thumb != nil {
 		t.Fatalf("expected nil for nil input, got %d bytes", len(thumb))
 	}
 }
@@ -109,7 +109,7 @@ func TestMakePDFThumbnail_RendersFirstPageWhenPopplerAvailable(t *testing.T) {
 	}
 
 	pdf := minimalPDF(t)
-	thumb := makePDFThumbnail(pdf, 200)
+	thumb, _, _ := makePDFThumbnail(pdf, 200)
 	if thumb == nil {
 		t.Fatal("expected a thumbnail from a valid PDF, got nil")
 	}

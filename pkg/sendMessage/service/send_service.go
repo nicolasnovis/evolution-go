@@ -101,6 +101,11 @@ type LinkStruct struct {
 	Url          string       `json:"url"`
 	Description  string       `json:"description"`
 	ImgUrl       string       `json:"imgUrl"`
+	// Prévia já pronta (o Novi busca, recorta e comprime): JPEG pequeno em base64 + tamanho.
+	// Com Title preenchido o motor NÃO busca nada sozinho.
+	JpegThumbnail   string `json:"jpegThumbnail"`
+	ThumbnailWidth  uint32 `json:"thumbnailWidth"`
+	ThumbnailHeight uint32 `json:"thumbnailHeight"`
 	Id           string       `json:"id"`
 	Delay        int32        `json:"delay"`
 	MentionedJID []string     `json:"mentionedJid"`
@@ -661,19 +666,33 @@ func (s *sendService) sendTextWithRetry(data *TextStruct, instance *instance_mod
 	return nil, fmt.Errorf("failed to send text after %d attempts", maxRetries)
 }
 
+// linkHTTP: busca de prévia com teto de tempo — antes era http.Get sem timeout (pendurava o envio).
+var linkHTTP = &http.Client{Timeout: 6 * time.Second}
+
+func linkGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	// se identificar como navegador: vários sites (Instagram etc.) devolvem a tela de login pra cliente "anônimo"
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8")
+	return linkHTTP.Do(req)
+}
+
 func fetchLinkMetadata(url string) (string, string, string, error) {
-	resp, err := http.Get(url)
+	resp, err := linkGet(url)
 	if err != nil {
 		return "", "", "", err
 	}
 	defer resp.Body.Close()
 
-	doc, err := html.Parse(resp.Body)
+	doc, err := html.Parse(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return "", "", "", err
 	}
 
-	var title, description, imgURL string
+	var title, ogTitle, description, imgURL string
 
 	var f func(*html.Node)
 	f = func(n *html.Node) {
@@ -696,7 +715,11 @@ func fetchLinkMetadata(url string) (string, string, string, error) {
 					description = content
 				}
 
-				if property == "og:image" && content != "" {
+				if property == "og:title" && content != "" {
+					ogTitle = content
+				}
+
+				if property == "og:image" && content != "" && imgURL == "" {
 					imgURL = content
 				}
 			}
@@ -709,14 +732,78 @@ func fetchLinkMetadata(url string) (string, string, string, error) {
 
 	f(doc)
 
-	return title, description, imgURL, nil
+	if ogTitle != "" {
+		title = ogTitle
+	}
+	return strings.TrimSpace(title), strings.TrimSpace(description), imgURL, nil
 }
 
 func (s *sendService) SendLink(data *LinkStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
 	return s.sendLinkWithRetry(data, instance, 3)
 }
 
+// buildLinkMessage monta o texto COM prévia de link (cartão: miniatura, título, descrição).
+//   - Prévia pronta (Title preenchido, como o Novi manda) → usa ela, sem buscar nada.
+//   - Sem Title → tenta buscar (com timeout); se falhar, vai SEM prévia.
+// Em NENHUM caso a prévia impede o envio: antes, falhar a busca derrubava a mensagem inteira.
+func buildLinkMessage(data *LinkStruct) *waE2E.ExtendedTextMessage {
+	ext := &waE2E.ExtendedTextMessage{Text: &data.Text}
+	matched := strings.TrimSpace(data.Url)
+	if matched == "" {
+		matched = findURL(data.Text)
+	}
+	if matched == "" {
+		return ext
+	}
+
+	var thumb []byte
+	if t := data.JpegThumbnail; t != "" {
+		if i := strings.Index(t, ","); strings.HasPrefix(t, "data:") && i > 0 {
+			t = t[i+1:]
+		}
+		if b, err := base64.StdEncoding.DecodeString(t); err == nil {
+			thumb = b
+		}
+	}
+	if data.Title == "" {
+		if title, desc, img, err := fetchLinkMetadata(matched); err == nil {
+			data.Title, data.Description = title, desc
+			// só aproveita a imagem se já for pequena (sem redimensionar aqui) — senão, prévia sem miniatura
+			if len(thumb) == 0 && img != "" {
+				if resp, err := linkGet(img); err == nil {
+					b, _ := io.ReadAll(io.LimitReader(resp.Body, 96<<10+1))
+					resp.Body.Close()
+					if len(b) <= 96<<10 {
+						thumb = b
+					}
+				}
+			}
+		}
+	}
+	if data.Title == "" {
+		return ext
+	}
+
+	previewType := waE2E.ExtendedTextMessage_NONE
+	ext.MatchedText = &matched
+	ext.Title = &data.Title
+	if data.Description != "" {
+		ext.Description = &data.Description
+	}
+	ext.PreviewType = &previewType
+	if len(thumb) > 0 {
+		ext.JPEGThumbnail = thumb
+		if data.ThumbnailWidth > 0 && data.ThumbnailHeight > 0 {
+			w, h := data.ThumbnailWidth, data.ThumbnailHeight
+			ext.ThumbnailWidth, ext.ThumbnailHeight = &w, &h
+		}
+	}
+	return ext
+}
+
 func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_model.Instance, maxRetries int) (*MessageSendStruct, error) {
+	// a prévia é montada UMA vez (pode buscar na rede) — não a cada tentativa de reenvio
+	ext := buildLinkMessage(data)
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendLink attempt %d/%d", instance.Id, attempt, maxRetries)
 
@@ -728,46 +815,7 @@ func (s *sendService) sendLinkWithRetry(data *LinkStruct, instance *instance_mod
 			continue
 		}
 
-		matchedText := findURL(data.Text)
-
-		if matchedText != "" {
-			title, description, imgUrl, err := fetchLinkMetadata(matchedText)
-			if err != nil {
-				if attempt == maxRetries {
-					return nil, err
-				}
-				continue
-			}
-
-			data.Title = title
-			data.Description = description
-			data.ImgUrl = imgUrl
-		}
-
-		var fileData []byte
-		if data.ImgUrl != "" {
-			resp, err := http.Get(data.ImgUrl)
-			if err != nil {
-				if attempt == maxRetries {
-					return nil, err
-				}
-				continue
-			}
-			defer resp.Body.Close()
-			fileData, _ = io.ReadAll(resp.Body)
-		}
-
-		previewType := waE2E.ExtendedTextMessage_VIDEO
-		msg := &waE2E.Message{
-			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-				Text:          &data.Text,
-				Title:         &data.Title,
-				MatchedText:   &matchedText,
-				JPEGThumbnail: fileData,
-				Description:   &data.Description,
-				PreviewType:   &previewType,
-			},
-		}
+		msg := &waE2E.Message{ExtendedTextMessage: ext}
 
 		message, err := s.SendMessage(instance, msg, "ExtendedTextMessage", &SendDataStruct{
 			Id:           data.Id,

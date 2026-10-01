@@ -1440,6 +1440,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 
+		// N1 PATCH: conversa @lid sem o número no evento → completa com o par do store (ver
+		// live_lid_alt.go). ANTES do swap abaixo, que é quem põe o número no Chat/Sender da entrada.
+		preencherAltDoLID(&evt.Info, mycli.lookupPNForLID)
+
 		// Trata o caso especial onde Sender é @lid e SenderAlt é @s.whatsapp.net
 		// Neste caso, devemos inverter: Sender e Chat devem ser @s.whatsapp.net, SenderAlt deve ser @lid
 		senderStr := evt.Info.Sender.String()

@@ -244,7 +244,14 @@ func (u *userService) performCheckUser(client *whatsmeow.Client, numbers []strin
 	for _, item := range resp {
 		// Consultar LID Store para obter LID associado ao JID
 		var lidStr *string
+		// N1 PATCH: WhatsApp answered with @lid → return the phone JID (see check_lid.go)
 		if client.Store.LIDs != nil {
+			item.JID, lidStr = resolverJIDdoCheck(item.JID, func(l types.JID) (types.JID, bool) {
+				pn, err := client.Store.LIDs.GetPNForLID(context.TODO(), l)
+				return pn, err == nil && !pn.IsEmpty()
+			})
+		}
+		if lidStr == nil && client.Store.LIDs != nil {
 			if lid, err := client.Store.LIDs.GetLIDForPN(context.TODO(), item.JID); err == nil && !lid.IsEmpty() {
 				lidString := fmt.Sprintf("%v", lid)
 				lidStr = &lidString

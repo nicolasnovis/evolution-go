@@ -93,6 +93,24 @@ type EditMessageStruct struct {
 	Chat      string `json:"chat"`
 	Message   string `json:"message"`
 	MessageID string `json:"messageId"`
+	// Kind = what the edited message IS: "" / "text" edits the text; "image", "video" and "document"
+	// edit the CAPTION. WhatsApp only applies an edit whose content matches the original type — a
+	// text edit sent for a photo never changes its caption.
+	Kind string `json:"kind,omitempty"`
+}
+
+// editContent builds the new content of an edit for the original message's kind.
+func editContent(kind, text string) *waE2E.Message {
+	switch kind {
+	case "image":
+		return &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: &text}}
+	case "video":
+		return &waE2E.Message{VideoMessage: &waE2E.VideoMessage{Caption: &text}}
+	case "document":
+		return &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{Caption: &text}}
+	default:
+		return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: &text}}
+	}
 }
 
 // PinMessageStruct fixa/desafixa uma mensagem NA CONVERSA (pin-in-chat nativo do WhatsApp: aparece
@@ -571,14 +589,7 @@ func (m *messageService) EditMessage(data *EditMessageStruct, instance *instance
 	resp, err := client.SendMessage(
 		context.Background(),
 		recipient,
-		client.BuildEdit(
-			recipient,
-			data.MessageID,
-			&waE2E.Message{
-				ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-					Text: &data.Message,
-				},
-			}))
+		client.BuildEdit(recipient, data.MessageID, editContent(data.Kind, data.Message)))
 	if err != nil {
 		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error revoking message: %v", instance.Id, err)
 		return "", "", err

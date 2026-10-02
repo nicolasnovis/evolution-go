@@ -156,7 +156,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/downloadmedia", r.messageHandler.DownloadMedia)
 			routes.POST("/status", r.messageHandler.GetMessageStatus)
 			routes.POST("/delete", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.DeleteMessageEveryone)
-			routes.POST("/edit", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.EditMessage) // TODO: edit MediaMessage too
+			routes.POST("/edit", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.EditMessage) // text or caption (image/video/document) — see EditMessageStruct.Kind
 			routes.POST("/pin", r.messageHandler.PinMessage)
 		}
 	}

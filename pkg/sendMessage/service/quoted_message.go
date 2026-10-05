@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -47,4 +48,35 @@ func (q QuotedStruct) QuotedMessage() *waE2E.Message {
 		// text, or an older caller that only sends messageId/participant (Text stays "")
 		return &waE2E.Message{Conversation: proto.String(text)}
 	}
+}
+
+// ContextInfo builds the reply context for a message sent to chat: StanzaID, Participant and the
+// quoted snapshot (exactly what every send path used to inline), plus RemoteJID when the quoted
+// message lives in ANOTHER chat — the "Reply privately" case, where a 1:1 message quotes a group
+// message. With RemoteJID the recipient's app tags the quote with the group and tapping it opens the
+// original; without it the quote looks like it came from the 1:1 chat itself.
+func (q QuotedStruct) ContextInfo(chat types.JID) *waE2E.ContextInfo {
+	ci := &waE2E.ContextInfo{
+		StanzaID:      proto.String(q.MessageID),
+		Participant:   proto.String(q.Participant),
+		QuotedMessage: q.QuotedMessage(),
+	}
+	if rj := q.quotedRemoteJID(chat); rj != "" {
+		ci.RemoteJID = proto.String(rj)
+	}
+	return ci
+}
+
+// quotedRemoteJID returns the chat to put in ContextInfo.RemoteJID, or "" when the quote belongs to
+// the destination chat itself (WhatsApp omits remoteJid for in-chat replies). chat may be the zero
+// JID when the caller does not know the destination yet.
+func (q QuotedStruct) quotedRemoteJID(chat types.JID) string {
+	rj := strings.TrimSpace(q.RemoteJid)
+	if rj == "" {
+		return ""
+	}
+	if !chat.IsEmpty() && (rj == chat.String() || rj == chat.ToNonAD().String()) {
+		return ""
+	}
+	return rj
 }

@@ -13,6 +13,8 @@ type ChatHandler interface {
 	ChatUnpin(ctx *gin.Context)
 	ChatArchive(ctx *gin.Context)
 	ChatUnarchive(ctx *gin.Context)
+	ChatRead(ctx *gin.Context)
+	ChatUnread(ctx *gin.Context)
 	ChatMute(ctx *gin.Context)
 	ChatUnmute(ctx *gin.Context)
 	DeleteMessageForMe(ctx *gin.Context)
@@ -419,4 +421,56 @@ func (c *chatHandler) DeleteMessageForMe(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "success"})
+}
+
+// Mark a chat as read
+// @Summary Mark a chat as read
+// @Description Clears the "unread" mark of the chat on the owner's WhatsApp (app state)
+// @Tags Chat
+// @Accept json
+// @Produce json
+// @Param message body chat_service.BodyStruct true "Chat"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /chat/read [post]
+func (c *chatHandler) ChatRead(ctx *gin.Context) { c.chatMarkRead(ctx, true) }
+
+// Mark a chat as unread
+// @Summary Mark a chat as unread
+// @Description Marks the chat as unread on the owner's WhatsApp (app state)
+// @Tags Chat
+// @Accept json
+// @Produce json
+// @Param message body chat_service.BodyStruct true "Chat"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /chat/unread [post]
+func (c *chatHandler) ChatUnread(ctx *gin.Context) { c.chatMarkRead(ctx, false) }
+
+func (c *chatHandler) chatMarkRead(ctx *gin.Context, read bool) {
+	getInstance := ctx.MustGet("instance")
+
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+
+	var data *chat_service.BodyStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if data.Chat == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "chat is required"})
+		return
+	}
+
+	if err := c.chatService.ChatMarkRead(data, instance, read); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": gin.H{"read": read}})
 }

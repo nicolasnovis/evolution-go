@@ -24,6 +24,7 @@ type ChatService interface {
 	ChatUnpin(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatArchive(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatUnarchive(data *BodyStruct, instance *instance_model.Instance) (string, error)
+	ChatMarkRead(data *BodyStruct, instance *instance_model.Instance, read bool) error
 	ChatMute(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	ChatUnmute(data *BodyStruct, instance *instance_model.Instance) (string, error)
 	DeleteMessageForMe(data *DeleteForMeStruct, instance *instance_model.Instance) error
@@ -302,6 +303,33 @@ func (c *chatService) ChatArchive(data *BodyStruct, instance *instance_model.Ins
 	}
 
 	return ts.String(), nil
+}
+
+// ChatMarkRead marca a conversa como LIDA/NÃO LIDA no WhatsApp do dono (app-state regular_low,
+// MarkChatAsReadAction) — a bolinha verde de "não lida" do celular. Não é o ✓✓ azul (isso é recibo,
+// /message/markread): é o estado da conversa, que o "Marcar como não lida" do celular grava. Mesmo
+// endereçamento do pin/arquivar (resolveAppStateTarget → LID) e mesma âncora da última msg do arquivar
+// (sem ela o WhatsApp pode ignorar a mutação). Passa pelo envio serializado por instância.
+func (c *chatService) ChatMarkRead(data *BodyStruct, instance *instance_model.Instance, read bool) error {
+	client, err := c.ensureClientConnected(instance.Id)
+	if err != nil {
+		return err
+	}
+
+	recipient, ok := utils.ParseJID(data.Chat)
+	if !ok {
+		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] Error validating message fields", instance.Id)
+		return errors.New("invalid phone number")
+	}
+
+	target := c.resolveAppStateTarget(client, recipient, instance.Id)
+	lastTs, lastKey := archiveAnchor(data, target)
+	err = c.sendAppStateResilient(client, appstate.BuildMarkChatAsRead(target, read, lastTs, lastKey), instance.Id)
+	if err != nil {
+		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error mark chat read=%v: %v", instance.Id, read, err)
+		return err
+	}
+	return nil
 }
 
 func (c *chatService) ChatUnarchive(data *BodyStruct, instance *instance_model.Instance) (string, error) {

@@ -2167,6 +2167,20 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["data"] = dataMap
 
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat pin changed", mycli.userID)
+	case *events.MarkChatAsRead:
+		// WA→CRM: o dono marcou a conversa como lida/não lida no celular ("Marcar como não lida").
+		// Mesmo esquema do Archive/Pin: map FRESCO só com o que o CRM lê, bool explícito (nil-safe).
+		doWebhook = true
+		postMap["event"] = "MarkChatAsRead"
+
+		dataMap := make(map[string]interface{})
+		dataMap["JID"] = evt.JID.String()
+		dataMap["Timestamp"] = evt.Timestamp
+		dataMap["Read"] = evt.Action.GetRead()
+		dataMap["FromFullSync"] = evt.FromFullSync
+		postMap["data"] = dataMap
+
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Chat read mark changed (read=%v)", mycli.userID, evt.Action.GetRead())
 	case *events.DeleteForMe:
 		// WA→CRM: a mensagem foi apagada "para mim" em outro aparelho (celular). Chega por app state
 		// (mutation deleteMessageForMe). Mesmo esquema do Archive/Pin: map FRESCO só com o que o CRM lê.
@@ -2653,7 +2667,7 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
-	case "ChatPresence", "Archive", "Pin", "DeleteForMe":
+	case "ChatPresence", "Archive", "Pin", "DeleteForMe", "MarkChatAsRead":
 		if contains(subscriptions, "CHAT_PRESENCE") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
@@ -2949,7 +2963,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 				globalEventType = "PRESENCE"
 			case "HistorySync":
 				globalEventType = "HISTORY_SYNC"
-			case "ChatPresence", "Archive", "Pin", "DeleteForMe":
+			case "ChatPresence", "Archive", "Pin", "DeleteForMe", "MarkChatAsRead":
 				globalEventType = "CHAT_PRESENCE"
 			case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 				globalEventType = "CALL"
@@ -3011,7 +3025,7 @@ func (w *whatsmeowService) SendToGlobalQueues(eventType string, payload []byte, 
 			globalEventType = "PRESENCE"
 		case "HistorySync":
 			globalEventType = "HISTORY_SYNC"
-		case "ChatPresence", "Archive", "Pin", "DeleteForMe":
+		case "ChatPresence", "Archive", "Pin", "DeleteForMe", "MarkChatAsRead":
 			globalEventType = "CHAT_PRESENCE"
 		case "CallOffer", "CallAccept", "CallTerminate", "CallOfferNotice", "CallRelayLatency":
 			globalEventType = "CALL"

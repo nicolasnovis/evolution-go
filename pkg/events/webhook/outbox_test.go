@@ -97,7 +97,7 @@ func TestLaneFor(t *testing.T) {
 	if got := laneFor("Contact", false); got != LaneSync {
 		t.Errorf("Contact deveria ir pra %q, foi pra %q", LaneSync, got)
 	}
-	for _, e := range []string{"Archive", "Pin", "LabelAssociationChat", "DeleteForMe"} {
+	for _, e := range []string{"Archive", "Pin", "LabelAssociationChat", "DeleteForMe", "MarkChatAsRead"} {
 		if got := laneFor(e, true); got != LaneSync {
 			t.Errorf("%q de full sync deveria ir pra %q, foi pra %q", e, LaneSync, got)
 		}

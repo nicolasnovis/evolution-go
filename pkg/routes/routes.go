@@ -168,6 +168,8 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/unpin", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnpin)           // CRM→WA: desafixa
 			routes.POST("/archive", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatArchive)       // CRM→WA: arquiva (âncora da última msg vem no body)
 			routes.POST("/unarchive", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnarchive)   // CRM→WA: desarquiva
+			routes.POST("/read", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatRead)             // CRM→WA: tira a marca de "não lida"
+			routes.POST("/unread", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnread)         // CRM→WA: marca como "não lida"
 			routes.POST("/mute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatMute)             // TODO: not working
 			routes.POST("/unmute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnmute)         // TODO: not working
 			routes.POST("/delete-for-me", r.chatHandler.DeleteMessageForMe) // CRM→WA: apagar para mim (some em todos os aparelhos deste número)

@@ -2145,6 +2145,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// .(map[...]) nele dava panic (bug pré-existente do fork). Montamos só os campos que o CRM lê.
 		dataMap := make(map[string]interface{})
 		dataMap["JID"] = evt.JID.String() // string limpa "num@s.whatsapp.net" (igual ao Presence)
+		mycli.addChatPN(dataMap, evt.JID)
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action
 		dataMap["Archived"] = evt.Action.GetArchived() // bool explícito (nil-safe) pro CRM não parsear o proto
@@ -2160,6 +2161,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// map FRESCO (mesmo motivo do Archive acima — o evento cru daria panic no .(map[...])).
 		dataMap := make(map[string]interface{})
 		dataMap["JID"] = evt.JID.String() // string limpa "num@s.whatsapp.net" (igual ao Presence)
+		mycli.addChatPN(dataMap, evt.JID)
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Action"] = evt.Action
 		dataMap["Pinned"] = evt.Action.GetPinned() // bool explícito (nil-safe) pro CRM não parsear o proto
@@ -2175,6 +2177,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		dataMap := make(map[string]interface{})
 		dataMap["JID"] = evt.JID.String()
+		mycli.addChatPN(dataMap, evt.JID)
 		dataMap["Timestamp"] = evt.Timestamp
 		dataMap["Read"] = evt.Action.GetRead()
 		dataMap["FromFullSync"] = evt.FromFullSync
@@ -3365,6 +3368,19 @@ func cleanSenderID(senderID string) string {
 		}
 	}
 	return senderID
+}
+
+// addChatPN põe "PN" (o número, "num@s.whatsapp.net") nos eventos de app-state de CONVERSA (Archive, Pin,
+// MarkChatAsRead) quando o JID vem como @lid. O WhatsApp migrou o índice dessas ações pra LID, e o CRM só
+// conhece o LID de parte dos contatos: sem o número, o evento do celular não acha a conversa e é ignorado
+// (mesma família do "contato fantasma" do @lid, resolvida no /user/check do 202610c mandando os dois).
+func (mycli *MyClient) addChatPN(dataMap map[string]interface{}, jid types.JID) {
+	if jid.Server != types.HiddenUserServer {
+		return
+	}
+	if pn, ok := mycli.lookupPNForLID(jid.ToNonAD().String()); ok {
+		dataMap["PN"] = pn
+	}
 }
 
 // lookupPNForLID consulta o mapa @lid → número acumulado no store do whatsmeow (última fonte do lidMap).

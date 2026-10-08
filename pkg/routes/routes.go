@@ -176,6 +176,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/recover-appstate", r.chatHandler.RecoverAppState) // destrava regular_low (recovery request)
 			routes.POST("/reset-appstate", r.chatHandler.ResetAppState)     // RESETA regular_low (fatal exception; desloga linkados)
 			routes.POST("/history-sync", r.chatHandler.HistorySyncRequest)
+			routes.POST("/request-unavailable", r.chatHandler.RequestUnavailable) // pede ao celular do dono a mensagem que este aparelho não tem
 		}
 	}
 	routes = eng.Group("/group")

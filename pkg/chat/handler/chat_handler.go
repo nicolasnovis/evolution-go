@@ -1,6 +1,7 @@
 package chat_handler
 
 import (
+	"errors"
 	"net/http"
 
 	chat_service "github.com/evolution-foundation/evolution-go/pkg/chat/service"
@@ -21,6 +22,7 @@ type ChatHandler interface {
 	RecoverAppState(ctx *gin.Context)
 	ResetAppState(ctx *gin.Context)
 	HistorySyncRequest(ctx *gin.Context)
+	RequestUnavailable(ctx *gin.Context)
 }
 
 type chatHandler struct {
@@ -375,6 +377,40 @@ func (c *chatHandler) HistorySyncRequest(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": resp})
+}
+
+// RequestUnavailable pede ao celular do dono o reenvio de mensagens que este aparelho não tem
+// @Summary Request unavailable messages from the primary device
+// @Description Sends a PLACEHOLDER_MESSAGE_RESEND peer request to our own phone (never to the contact). The phone answers asynchronously; the messages arrive as regular Message webhooks with UnavailableRequestID set.
+// @Tags Chat
+// @Accept json
+// @Produce json
+// @Param message body chat_service.RequestUnavailableStruct true "Chat, sender and message ids (max 10)"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /chat/request-unavailable [post]
+func (c *chatHandler) RequestUnavailable(ctx *gin.Context) {
+	instance, ok := ctx.MustGet("instance").(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+	var data *chat_service.RequestUnavailableStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil || data == nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	pedidos, err := c.chatService.RequestUnavailable(data, instance)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, chat_service.ErrPedidoDeReenvioInvalido) {
+			status = http.StatusBadRequest
+		}
+		ctx.JSON(status, gin.H{"error": err.Error(), "data": pedidos})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": pedidos})
 }
 
 func NewChatHandler(

@@ -31,6 +31,7 @@ type ChatService interface {
 	RecoverAppState(instance *instance_model.Instance) error
 	ResetAppState(instance *instance_model.Instance) error
 	HistorySyncRequest(data *HistorySyncRequestStruct, instance *instance_model.Instance) (*whatsmeow.SendResponse, error)
+	RequestUnavailable(data *RequestUnavailableStruct, instance *instance_model.Instance) ([]string, error)
 }
 
 type chatService struct {
@@ -186,6 +187,12 @@ func (c *chatService) resolveAppStateTarget(client *whatsmeow.Client, recipient 
 	}
 	c.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] app-state target: %s → %s (LID)", instanceId, recipient.String(), lid.String())
 	return lid
+}
+
+type RequestUnavailableStruct struct {
+	Chat   string   `json:"chat"`
+	Sender string   `json:"sender"`
+	IDs    []string `json:"ids"`
 }
 
 type HistorySyncRequestStruct struct {
@@ -471,6 +478,32 @@ func (c *chatService) HistorySyncRequest(data *HistorySyncRequestStruct, instanc
 	}
 
 	return &res, nil
+}
+
+// RequestUnavailable pede ao celular do dono (aparelho principal) que reenvie mensagens que este
+// aparelho vinculado não tem (PLACEHOLDER_MESSAGE_RESEND). É um peer message pro NOSSO aparelho —
+// nunca vai pro contato. A resposta chega assíncrona como events.Message normal, com
+// UnavailableRequestID preenchido, e segue o webhook de sempre. Devolve o id de cada pedido enviado.
+func (c *chatService) RequestUnavailable(data *RequestUnavailableStruct, instance *instance_model.Instance) ([]string, error) {
+	chat, sender, ids, err := montarPedidoDeReenvio(data)
+	if err != nil {
+		return nil, err
+	}
+	client, err := c.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+	enviados := make([]string, 0, len(ids))
+	for _, id := range ids {
+		res, err := client.SendPeerMessage(context.Background(), client.BuildUnavailableMessageRequest(chat, sender, id))
+		if err != nil {
+			c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] request-unavailable %s em %s falhou: %v", instance.Id, id, chat.String(), err)
+			return enviados, err
+		}
+		c.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] request-unavailable enviado: msg %s chat %s sender %s (pedido %s)", instance.Id, id, chat.String(), sender.String(), res.ID)
+		enviados = append(enviados, res.ID)
+	}
+	return enviados, nil
 }
 
 func NewChatService(

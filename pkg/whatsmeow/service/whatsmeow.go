@@ -542,6 +542,11 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	client.EnableAutoReconnect = false
 	client.AutoTrustIdentity = true
+	// N1 PATCH: when a message can't be decrypted and the sender's retry doesn't fix it, ask our own
+	// phone (primary device) to resend it (PLACEHOLDER_MESSAGE_RESEND). The answer comes back as a
+	// regular events.Message with UnavailableRequestID set. Without this, undecryptable 1:1 messages
+	// that the phone shows were lost for good on the CRM side.
+	client.AutomaticMessageRerequestFromPhone = true
 
 	mycli := &MyClient{
 		service:            &w,
@@ -1385,24 +1390,38 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			}
 		}
 
-		// se ignoreStatus for true e o chat for broadcast ou o id for broadcast retorna
-		if mycli.Instance.IgnoreStatus && (strings.Contains(evt.Info.Chat.String(), "@broadcast") || strings.Contains(evt.Info.ID, "@broadcast")) {
+		// N1 PATCH: "ignorar status" ignora SÓ o Status (status@broadcast). Antes o teste era
+		// Contains("@broadcast"), que engolia em silêncio as LISTAS DE TRANSMISSÃO (<n>@broadcast) —
+		// mensagens 1:1 reais que o contato manda por lista (incidente cliente A, 08/10).
+		isStatusBroadcast := evt.Info.Chat == types.StatusBroadcastJID
+		if mycli.Instance.IgnoreStatus && isStatusBroadcast {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Message ignored (status broadcast, instance ignoreStatus) - ID: %s", mycli.userID, evt.Info.ID)
 			return
 		}
 
 		// se ignoreGroup for true e o chat for grupo retorna
 		if mycli.Instance.IgnoreGroups && strings.Contains(evt.Info.Chat.String(), "@g.us") {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Message ignored (group, instance ignoreGroups) - ID: %s", mycli.userID, evt.Info.ID)
 			return
 		}
 
 		// Verifica advanced settings para ignorar grupos
 		if (mycli.config.EventIgnoreGroup || mycli.Instance.IgnoreGroups) && strings.Contains(evt.Info.Chat.String(), "@g.us") {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Message ignored (group, EVENT_IGNORE_GROUP) - ID: %s", mycli.userID, evt.Info.ID)
 			return
 		}
 
-		// Verifica advanced settings para ignorar status/broadcast
-		if (mycli.config.EventIgnoreStatus || mycli.Instance.IgnoreStatus) && (strings.Contains(evt.Info.Chat.String(), "@broadcast") || strings.Contains(evt.Info.ID, "@broadcast")) {
+		// Verifica advanced settings para ignorar status — SÓ status@broadcast (ver N1 PATCH acima)
+		if (mycli.config.EventIgnoreStatus || mycli.Instance.IgnoreStatus) && isStatusBroadcast {
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Message ignored (status broadcast, EVENT_IGNORE_STATUS) - ID: %s", mycli.userID, evt.Info.ID)
 			return
+		}
+
+		// N1 PATCH: mensagem RECEBIDA por lista de transmissão vira 1:1 com quem mandou (ver
+		// broadcast_list.go). A lista original vai em postMap["broadcastList"] só pra rastreio.
+		if listJID, ok := rotearListaDeTransmissao(&evt.Info, evt.Message.GetPollUpdateMessage() != nil); ok {
+			postMap["broadcastList"] = listJID
+			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Broadcast list message %s from %s (list %s) -> delivered as 1:1", mycli.userID, evt.Info.ID, evt.Info.Sender.String(), listJID)
 		}
 
 		// N1 PATCH: decrypt edited-message text (secretEncryptedMessage / MESSAGE_EDIT).
@@ -2415,6 +2434,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		postMap["event"] = "UserAbout"
 	case *events.IdentityChange:
 		doWebhook = false
+		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Identity changed for %s (implicit=%v)", mycli.userID, evt.JID.String(), evt.Implicit)
 	case *events.GroupInfo:
 		doWebhook = true
 		postMap["event"] = "GroupInfo"

@@ -28,3 +28,26 @@ func rotearListaDeTransmissao(info *types.MessageInfo, isPollUpdate bool) (strin
 	info.Chat = info.Sender.ToNonAD()
 	return list, true
 }
+
+// N1 PATCH — número do remetente na mensagem REENVIADA pelo celular / recebida por lista.
+//
+// A mensagem que volta por reenvio (PLACEHOLDER_MESSAGE_RESEND, UnavailableRequestID) é remontada pelo
+// whatsmeow a partir do WebMessageInfo (ParseWebMessage) e NÃO traz SenderAlt. Sem ele o swap
+// @lid→número não acontece e o CRM recebe Chat=@lid: se o contato nunca teve mensagem viva (justamente
+// o caso de "a 1ª mensagem se perdeu"), o Novi não acha o número e criava um contato fantasma @lid.
+// A lista de transmissão já roteada pra 1:1 pode vir sem o alt também. Aqui completa o SenderAlt pelo
+// store (whatsmeow_lid_map) — o swap logo depois faz o resto, igual a uma 1:1 viva.
+//
+// Fica de fora: saída do dono (fromMe — tem caminho próprio), grupo (o chat é o grupo) e voto de
+// enquete (a chave do voto é derivada com o Sender @lid; o swap antes do decrypt quebraria o voto).
+// Sem o par no store, nada muda.
+func preencherAltDoRemetente(info *types.MessageInfo, aplicar, isPollUpdate bool, lookup func(lid string) (string, bool)) {
+	if !aplicar || info == nil || info.IsFromMe || info.IsGroup || isPollUpdate || !info.SenderAlt.IsEmpty() || info.Sender.Server != types.HiddenUserServer {
+		return
+	}
+	if pn, ok := lookup(info.Sender.ToNonAD().String()); ok {
+		if jid, err := types.ParseJID(pn); err == nil {
+			info.SenderAlt = jid
+		}
+	}
+}

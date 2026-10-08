@@ -1419,7 +1419,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		// N1 PATCH: mensagem RECEBIDA por lista de transmissão vira 1:1 com quem mandou (ver
 		// broadcast_list.go). A lista original vai em postMap["broadcastList"] só pra rastreio.
+		roteadaDeLista := false
 		if listJID, ok := rotearListaDeTransmissao(&evt.Info, evt.Message.GetPollUpdateMessage() != nil); ok {
+			roteadaDeLista = true
 			postMap["broadcastList"] = listJID
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Broadcast list message %s from %s (list %s) -> delivered as 1:1", mycli.userID, evt.Info.ID, evt.Info.Sender.String(), listJID)
 		}
@@ -1462,6 +1464,8 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// N1 PATCH: conversa @lid sem o número no evento → completa com o par do store (ver
 		// live_lid_alt.go). ANTES do swap abaixo, que é quem põe o número no Chat/Sender da entrada.
 		preencherAltDoLID(&evt.Info, mycli.lookupPNForLID)
+		// reenvio do celular / lista roteada: o número do remetente pro swap (ver broadcast_list.go)
+		preencherAltDoRemetente(&evt.Info, evt.UnavailableRequestID != "" || roteadaDeLista, evt.Message.GetPollUpdateMessage() != nil, mycli.lookupPNForLID)
 
 		// Trata o caso especial onde Sender é @lid e SenderAlt é @s.whatsapp.net
 		// Neste caso, devemos inverter: Sender e Chat devem ser @s.whatsapp.net, SenderAlt deve ser @lid

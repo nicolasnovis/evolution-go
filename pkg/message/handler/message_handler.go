@@ -19,6 +19,7 @@ type MessageHandler interface {
 	DeleteMessageEveryone(ctx *gin.Context)
 	EditMessage(ctx *gin.Context)
 	PinMessage(ctx *gin.Context)
+	VotePoll(ctx *gin.Context)
 }
 
 type messageHandler struct {
@@ -507,4 +508,35 @@ func NewMessageHandler(
 	return &messageHandler{
 		messageService: messageService,
 	}
+}
+
+// VotePoll votes on an existing poll (or removes the vote with an empty options list)
+// @Summary Vote on a poll
+// @Tags Message
+// @Accept json
+// @Produce json
+// @Param message body message_service.VotePollStruct true "Poll vote"
+// @Success 200 {object} gin.H "success"
+// @Router /message/pollvote [post]
+func (m *messageHandler) VotePoll(ctx *gin.Context) {
+	instance, ok := ctx.MustGet("instance").(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+	var data *message_service.VotePollStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil || data == nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if data.Number == "" || data.PollId == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "number and pollId are required"})
+		return
+	}
+	id, err := m.messageService.VotePoll(data, instance)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": gin.H{"id": id}})
 }

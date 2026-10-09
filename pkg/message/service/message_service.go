@@ -35,6 +35,7 @@ type MessageService interface {
 	DeleteMessageEveryone(data *MessageStruct, instance *instance_model.Instance) (string, string, error)
 	EditMessage(data *EditMessageStruct, instance *instance_model.Instance) (string, string, error)
 	PinMessage(data *PinMessageStruct, instance *instance_model.Instance) (string, string, error)
+	VotePoll(data *VotePollStruct, instance *instance_model.Instance) (string, error)
 }
 
 type messageService struct {

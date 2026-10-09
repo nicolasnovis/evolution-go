@@ -152,6 +152,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/presence", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.ChatPresence)
 			routes.POST("/subscribe", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.SubscribePresence)
 			routes.POST("/markread", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.MarkRead)
+			routes.POST("/pollvote", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.VotePoll)
 			routes.POST("/markplayed", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.MarkPlayed)
 			routes.POST("/downloadmedia", r.messageHandler.DownloadMedia)
 			routes.POST("/status", r.messageHandler.GetMessageStatus)

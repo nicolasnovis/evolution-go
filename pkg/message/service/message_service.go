@@ -69,11 +69,15 @@ type SubscribePresenceStruct struct {
 type MarkReadStruct struct {
 	Id     []string `json:"id"`
 	Number string   `json:"number"`
+	// Senders maps message id -> author JID. Required for groups: a group read receipt must name the
+	// participant who wrote each message, otherwise WhatsApp drops it and the phone stays unread.
+	Senders map[string]string `json:"senders,omitempty"`
 }
 
 type MarkPlayedStruct struct {
-	Id     []string `json:"id"`
-	Number string   `json:"number"`
+	Id      []string          `json:"id"`
+	Number  string            `json:"number"`
+	Senders map[string]string `json:"senders,omitempty"`
 }
 
 type DownloadMediaStruct struct {
@@ -391,10 +395,11 @@ func (m *messageService) MarkRead(data *MarkReadStruct, instance *instance_model
 	// reaches the recipient. Same root cause as the typing fix above.
 	jid = utils.CanonicalJID(jid)
 
-	err = client.MarkRead(context.Background(), data.Id, time.Now(), jid, jid)
-	if err != nil {
-		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error marking message as read: %v", instance.Id, err)
-		return "", errors.New("error marking message as read")
+	for _, lote := range recibosPorAutor(data.Id, data.Senders, jid) {
+		if err = client.MarkRead(context.Background(), lote.ids, time.Now(), jid, lote.sender); err != nil {
+			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error marking message as read: %v", instance.Id, err)
+			return "", errors.New("error marking message as read")
+		}
 	}
 
 	return ts.String(), nil
@@ -418,10 +423,11 @@ func (m *messageService) MarkPlayed(data *MarkPlayedStruct, instance *instance_m
 	// reaches the recipient. Same root cause as the MarkRead fix.
 	jid = utils.CanonicalJID(jid)
 
-	err = client.MarkRead(context.Background(), data.Id, time.Now(), jid, jid, types.ReceiptTypePlayed)
-	if err != nil {
-		m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error marking message as played: %v", instance.Id, err)
-		return "", errors.New("error marking message as played")
+	for _, lote := range recibosPorAutor(data.Id, data.Senders, jid) {
+		if err = client.MarkRead(context.Background(), lote.ids, time.Now(), jid, lote.sender, types.ReceiptTypePlayed); err != nil {
+			m.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error marking message as played: %v", instance.Id, err)
+			return "", errors.New("error marking message as played")
+		}
 	}
 
 	return ts.String(), nil

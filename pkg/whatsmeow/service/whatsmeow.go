@@ -2750,6 +2750,13 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}
+	case "PollVote":
+		// N1 PATCH: without this case the decrypted vote fell through to default:return — no vote
+		// from WhatsApp (phone or other people) ever reached the CRM. A vote belongs with MESSAGE.
+		if contains(subscriptions, "POLL_VOTE") || contains(subscriptions, "MESSAGE") {
+			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
+			w.sendToQueueOrWebhook(instance, queueName, jsonData)
+		}
 
 	default:
 		return

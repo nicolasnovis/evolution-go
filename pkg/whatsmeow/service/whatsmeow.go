@@ -1594,6 +1594,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						"chat":            evt.Info.Chat.String(),
 						"selectedOptions": selectedHex,
 						"timestamp":       evt.Info.Timestamp.Unix(),
+						"fromMe":          evt.Info.IsFromMe,
 					},
 					"instanceToken": mycli.token,
 					"instanceId":    mycli.userID,

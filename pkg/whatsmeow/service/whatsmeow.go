@@ -2117,7 +2117,10 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			message.Status = "Delivered"
 			message.Source = evt.Chat.ToNonAD().User
 
-			messageKey := fmt.Sprintf("%s_%s_%s", mycli.userID, evt.MessageIDs[0], "Delivered")
+			// N1 PATCH: in a GROUP every participant sends its own delivery receipt for the SAME id.
+			// Without the sender in the key only the first one passed and the CRM never saw "delivered
+			// to all" (single tick forever).
+			messageKey := fmt.Sprintf("%s_%s_%s_%s", mycli.userID, evt.MessageIDs[0], "Delivered", evt.Sender.ToNonAD().String())
 			if _, found := mycli.processedMessages.Get(messageKey); found {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Message duplicated ignored: %s", mycli.userID, evt.MessageIDs[0])
 				return

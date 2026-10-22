@@ -176,6 +176,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/delete-for-me", r.chatHandler.DeleteMessageForMe) // CRM→WA: apagar para mim (some em todos os aparelhos deste número)
 			routes.POST("/recover-appstate", r.chatHandler.RecoverAppState) // destrava regular_low (recovery request)
 			routes.POST("/reset-appstate", r.chatHandler.ResetAppState)     // RESETA regular_low (fatal exception; desloga linkados)
+			routes.POST("/sync-stickers", r.chatHandler.SyncFavoriteStickers) // figurinhas favoritas do celular → webhook FavoriteSticker
 			routes.POST("/history-sync", r.chatHandler.HistorySyncRequest)
 			routes.POST("/request-unavailable", r.chatHandler.RequestUnavailable) // pede ao celular do dono a mensagem que este aparelho não tem
 		}

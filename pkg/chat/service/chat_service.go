@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ type ChatService interface {
 	DeleteMessageForMe(data *DeleteForMeStruct, instance *instance_model.Instance) error
 	RecoverAppState(instance *instance_model.Instance) error
 	ResetAppState(instance *instance_model.Instance) error
+	SyncFavoriteStickers(instance *instance_model.Instance) ([]string, error)
 	HistorySyncRequest(data *HistorySyncRequestStruct, instance *instance_model.Instance) (*whatsmeow.SendResponse, error)
 	RequestUnavailable(data *RequestUnavailableStruct, instance *instance_model.Instance) ([]string, error)
 }
@@ -121,6 +123,44 @@ func (c *chatService) RecoverAppState(instance *instance_model.Instance) error {
 	}
 	c.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] app-state recovery request enviado (regular_low) — aguardando o primário responder", instance.Id)
 	return nil
+}
+
+// SyncFavoriteStickers (N1) puxa as figurinhas FAVORITAS do WhatsApp: um full sync das coleções
+// regular_high e regular_low re-emite cada favorita como events.FavoriteSticker (patch na
+// whatsmeow-lib), e o handler baixa e manda pro webhook (favorite_sticker.go). O full sync é o mesmo da
+// auto-cura (troca o estado local pelo snapshot do servidor) e não emite os outros eventos de app-state.
+// Pula coleção envenenada; serializa com os sends (mesma trava por instância). Devolve as coleções sincronizadas.
+func (c *chatService) SyncFavoriteStickers(instance *instance_model.Instance) ([]string, error) {
+	client, err := c.ensureClientConnected(instance.Id)
+	if err != nil {
+		return nil, err
+	}
+	muAny, _ := c.appStateMu.LoadOrStore(instance.Id, &sync.Mutex{})
+	mu := muAny.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	var feitas []string
+	var erros []string
+	for _, name := range []appstate.WAPatchName{appstate.WAPatchRegularHigh, appstate.WAPatchRegularLow} {
+		if appstatehealth.IsPoisoned(instance.Id, string(name)) {
+			erros = append(erros, string(name)+": envenenado")
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		err := client.FetchAppState(ctx, name, true, false)
+		cancel()
+		if err != nil {
+			c.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] sync de figurinhas: full sync de %s falhou: %v", instance.Id, name, err)
+			erros = append(erros, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		feitas = append(feitas, string(name))
+	}
+	if len(feitas) == 0 {
+		return nil, fmt.Errorf("nenhuma coleção sincronizou: %s", strings.Join(erros, "; "))
+	}
+	c.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] sync de figurinhas favoritas: %v", instance.Id, feitas)
+	return feitas, nil
 }
 
 // ResetAppState pede ao aparelho PRIMÁRIO pra RESETAR a coleção regular_low (apaga o patch envenenado

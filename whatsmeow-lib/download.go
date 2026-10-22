@@ -313,7 +313,9 @@ func (cli *Client) downloadAndDecrypt(
 
 	} else if data, err = cbcutil.Decrypt(cipherKey, iv, ciphertext); err != nil {
 		err = fmt.Errorf("failed to decrypt file: %w", err)
-	} else if len(fileSHA256) != 32 || sha256.Sum256(data) != *(*[32]byte)(fileSHA256) {
+	} else if fileSHA256 != nil && (len(fileSHA256) != 32 || sha256.Sum256(data) != *(*[32]byte)(fileSHA256)) {
+		// N1 PATCH: nil = caller passed allowNoHash (e.g. favorite stickers carry no plaintext hash);
+		// the MAC above already authenticated the ciphertext.
 		err = ErrInvalidMediaSHA256
 	}
 	return

@@ -202,6 +202,23 @@ func (cli *Client) collectEventsToDispatch(
 		}
 	}
 	for _, mutation := range mutations {
+		// N1 PATCH: favorite stickers always surface — on a full sync too — so a full sync of the
+		// collection is how a client pulls the current favorites list (see events.FavoriteSticker).
+		if len(mutation.Index) > 0 && mutation.Index[0] == appstate.IndexFavoriteSticker {
+			evt := &events.FavoriteSticker{FromFullSync: fullSync, Removed: mutation.Operation == waServerSync.SyncdMutation_REMOVE}
+			if len(mutation.Index) > 1 {
+				evt.Hash = mutation.Index[1]
+			}
+			if !evt.Removed {
+				evt.Action = mutation.Action.GetStickerAction()
+				evt.Timestamp = time.UnixMilli(mutation.Action.GetTimestamp())
+			}
+			if eventsToDispatch != nil {
+				*eventsToDispatch = append(*eventsToDispatch, evt)
+			} else {
+				cli.dispatchEvent(evt)
+			}
+		}
 		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
 			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
 		}

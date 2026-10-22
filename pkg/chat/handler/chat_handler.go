@@ -21,6 +21,7 @@ type ChatHandler interface {
 	DeleteMessageForMe(ctx *gin.Context)
 	RecoverAppState(ctx *gin.Context)
 	ResetAppState(ctx *gin.Context)
+	SyncFavoriteStickers(ctx *gin.Context)
 	HistorySyncRequest(ctx *gin.Context)
 	RequestUnavailable(ctx *gin.Context)
 }
@@ -319,6 +320,29 @@ func (c *chatHandler) RecoverAppState(ctx *gin.Context) {
 		return
 	}
 	ctx.JSON(http.StatusOK, gin.H{"message": "recovery request sent"})
+}
+
+// SyncFavoriteStickers puxa as figurinhas favoritas do WhatsApp: cada uma chega no webhook como
+// evento FavoriteSticker (com a imagem em base64). Sem body.
+// @Summary Sync favorite stickers
+// @Tags Chat
+// @Produce json
+// @Success 200 {object} gin.H "success"
+// @Failure 500 {object} gin.H "Internal server error"
+// @Router /chat/sync-stickers [post]
+func (c *chatHandler) SyncFavoriteStickers(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found"})
+		return
+	}
+	colecoes, err := c.chatService.SyncFavoriteStickers(instance)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"message": "favorite stickers sync started", "collections": colecoes})
 }
 
 // ResetAppState pede ao primário pra RESETAR a regular_low. ⚠️ desloga os dispositivos linkados

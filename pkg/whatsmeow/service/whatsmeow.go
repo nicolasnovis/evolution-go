@@ -2235,6 +2235,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] History sync event received %+v", mycli.userID, evt.Data.SyncType)
 	case *events.AppState:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] App state event received %+v", mycli.userID, evt)
+	case *events.FavoriteSticker:
+		// downloads media — off the event goroutine (see favorite_sticker.go)
+		go mycli.sendFavoriteSticker(evt)
 	case *events.LoggedOut:
 		doWebhook = true
 		postMap["event"] = "LoggedOut"
@@ -2750,6 +2753,12 @@ func (w *whatsmeowService) CallWebhook(instance *instance_model.Instance, queueN
 		}
 	case "ButtonClick":
 		if contains(subscriptions, "BUTTON_CLICK") || contains(subscriptions, "MESSAGE") {
+			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
+			w.sendToQueueOrWebhook(instance, queueName, jsonData)
+		}
+	case "FavoriteSticker":
+		// N1 PATCH: starred stickers synced from the phone (favorite_sticker.go). Rides MESSAGE.
+		if contains(subscriptions, "STICKER") || contains(subscriptions, "MESSAGE") {
 			w.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Event received of type %s", instance.Id, eventType)
 			w.sendToQueueOrWebhook(instance, queueName, jsonData)
 		}

@@ -1,4 +1,4 @@
-package service
+package whatsmeow_service
 
 import (
 	"context"

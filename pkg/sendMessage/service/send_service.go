@@ -2752,126 +2752,19 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 	isGroup := strings.Contains(data.Number, "@g.us")
 	isNewsletter := strings.Contains(data.Number, "@newsletter")
 
-	// Only try to get participants for actual groups, not newsletters
+	// Mentions only make sense in actual groups, not newsletters
 	if isGroup && !isNewsletter {
-		if data.MentionAll {
-			groupInfo, err := s.clientPointer[instance.Id].GetGroupInfo(context.Background(), recipient)
-			if err != nil {
-				return nil, err
+		// @all/@todos like WhatsApp itself sends it (seen on a real phone message, 27/10): the text keeps
+		// "@all" and contextInfo carries nonJIDMentions=1 — no participant list. The old way (every
+		// participant JID hidden in mentionedJID, no matching "@..." tokens in the text) showed a plain
+		// "@all" on the phones and the notification was unreliable.
+		// Named mentions are ADDED next to it; before, they replaced the @all list.
+		if ci := contextInfoParaMencao(msg, messageType); ci != nil {
+			if data.MentionAll {
+				ci.NonJIDMentions = proto.Uint32(1)
 			}
-
-			var mentionedJIDs []string
-			for _, participant := range groupInfo.Participants {
-				mentionedJIDs = append(mentionedJIDs, participant.JID.String())
-			}
-
-			switch messageType {
-			case "ExtendedTextMessage":
-				if msg.ExtendedTextMessage.ContextInfo == nil {
-					msg.ExtendedTextMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.ExtendedTextMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "ImageMessage":
-				if msg.ImageMessage.ContextInfo == nil {
-					msg.ImageMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.ImageMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "VideoMessage":
-				if msg.VideoMessage.ContextInfo == nil {
-					msg.VideoMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.VideoMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "PtvMessage":
-				if msg.PtvMessage.ContextInfo == nil {
-					msg.PtvMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.PtvMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "AudioMessage":
-				if msg.AudioMessage.ContextInfo == nil {
-					msg.AudioMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.AudioMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "DocumentMessage":
-				if msg.DocumentMessage.ContextInfo == nil {
-					msg.DocumentMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.DocumentMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "PollCreationMessage":
-				if msg.PollCreationMessage.ContextInfo == nil {
-					msg.PollCreationMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.PollCreationMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "StickerMessage":
-				if msg.StickerMessage.ContextInfo == nil {
-					msg.StickerMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.StickerMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "LocationMessage":
-				if msg.LocationMessage.ContextInfo == nil {
-					msg.LocationMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.LocationMessage.ContextInfo.MentionedJID = mentionedJIDs
-			case "ContactMessage":
-				if msg.ContactMessage.ContextInfo == nil {
-					msg.ContactMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.ContactMessage.ContextInfo.MentionedJID = mentionedJIDs
-			}
-
-		}
-
-		if len(data.MentionedJID) > 0 {
-			switch messageType {
-			case "ExtendedTextMessage":
-				if msg.ExtendedTextMessage.ContextInfo == nil {
-					msg.ExtendedTextMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.ExtendedTextMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "ImageMessage":
-				if msg.ImageMessage.ContextInfo == nil {
-					msg.ImageMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.ImageMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "VideoMessage":
-				if msg.VideoMessage.ContextInfo == nil {
-					msg.VideoMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.VideoMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "PtvMessage":
-				if msg.PtvMessage.ContextInfo == nil {
-					msg.PtvMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.PtvMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "AudioMessage":
-				if msg.AudioMessage.ContextInfo == nil {
-					msg.AudioMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.AudioMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "DocumentMessage":
-				if msg.DocumentMessage.ContextInfo == nil {
-					msg.DocumentMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.DocumentMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "PollCreationMessage":
-				if msg.PollCreationMessage.ContextInfo == nil {
-					msg.PollCreationMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.PollCreationMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "StickerMessage":
-				if msg.StickerMessage.ContextInfo == nil {
-					msg.StickerMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.StickerMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "LocationMessage":
-				if msg.LocationMessage.ContextInfo == nil {
-					msg.LocationMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.LocationMessage.ContextInfo.MentionedJID = data.MentionedJID
-			case "ContactMessage":
-				if msg.ContactMessage.ContextInfo == nil {
-					msg.ContactMessage.ContextInfo = &waE2E.ContextInfo{}
-				}
-				msg.ContactMessage.ContextInfo.MentionedJID = data.MentionedJID
+			if len(data.MentionedJID) > 0 {
+				ci.MentionedJID = data.MentionedJID
 			}
 		}
 	}
@@ -3461,3 +3354,38 @@ func NewSendService(
 		loggerWrapper:    loggerWrapper,
 	}
 }
+
+// contextInfoParaMencao returns the ContextInfo of the message being sent (creating it when missing),
+// for the message types that carry mentions; nil for any other type.
+func contextInfoParaMencao(msg *waE2E.Message, messageType string) *waE2E.ContextInfo {
+	garantir := func(ci **waE2E.ContextInfo) *waE2E.ContextInfo {
+		if *ci == nil {
+			*ci = &waE2E.ContextInfo{}
+		}
+		return *ci
+	}
+	switch messageType {
+	case "ExtendedTextMessage":
+		return garantir(&msg.ExtendedTextMessage.ContextInfo)
+	case "ImageMessage":
+		return garantir(&msg.ImageMessage.ContextInfo)
+	case "VideoMessage":
+		return garantir(&msg.VideoMessage.ContextInfo)
+	case "PtvMessage":
+		return garantir(&msg.PtvMessage.ContextInfo)
+	case "AudioMessage":
+		return garantir(&msg.AudioMessage.ContextInfo)
+	case "DocumentMessage":
+		return garantir(&msg.DocumentMessage.ContextInfo)
+	case "PollCreationMessage":
+		return garantir(&msg.PollCreationMessage.ContextInfo)
+	case "StickerMessage":
+		return garantir(&msg.StickerMessage.ContextInfo)
+	case "LocationMessage":
+		return garantir(&msg.LocationMessage.ContextInfo)
+	case "ContactMessage":
+		return garantir(&msg.ContactMessage.ContextInfo)
+	}
+	return nil
+}
+

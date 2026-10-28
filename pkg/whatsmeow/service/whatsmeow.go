@@ -1939,14 +1939,17 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		delete(dataMap, "RawMessage")
 
 		if message, ok := dataMap["Message"].(map[string]interface{}); ok {
+			// N1: photo/video keep the tiny inline JPEG thumbnail WhatsApp ships with the message — the CRM
+			// shows it blurred while the full file downloads (no blank box). Oversized ones are still dropped
+			// so the webhook stays small.
 			if imageMessage, ok := message["imageMessage"].(map[string]interface{}); ok {
-				delete(imageMessage, "JPEGThumbnail")
+				keepSmallThumbnail(imageMessage)
 				message["imageMessage"] = imageMessage
 				dataMap["Message"] = message
 			}
 
 			if videoMessage, ok := message["videoMessage"].(map[string]interface{}); ok {
-				delete(videoMessage, "JPEGThumbnail")
+				keepSmallThumbnail(videoMessage)
 				message["videoMessage"] = videoMessage
 				dataMap["Message"] = message
 			}
@@ -3441,4 +3444,14 @@ func (mycli *MyClient) lookupPNForLID(lid string) (string, bool) {
 		return "", false
 	}
 	return pn.ToNonAD().String(), true
+}
+
+// maxInlineThumbnailB64 caps the base64 thumbnail kept in the webhook (WhatsApp's are usually 1–6 KB).
+const maxInlineThumbnailB64 = 16 * 1024
+
+// keepSmallThumbnail drops JPEGThumbnail unless it is a reasonably small base64 string.
+func keepSmallThumbnail(media map[string]interface{}) {
+	if t, ok := media["JPEGThumbnail"].(string); !ok || t == "" || len(t) > maxInlineThumbnailB64 {
+		delete(media, "JPEGThumbnail")
+	}
 }

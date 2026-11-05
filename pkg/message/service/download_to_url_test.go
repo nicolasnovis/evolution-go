@@ -287,7 +287,10 @@ func TestDownloadMediaToUrl_TooLargeDeclared_NoDownload(t *testing.T) {
 	fs := newFakeStorage(t)
 	dir := setupGuard(t, fs, 0)
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error {
+		downloads.Add(1)
+		return nil
+	}
 
 	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(101), UploadUrl: fs.uploadURL(), MaxBytes: 100}, deps(fs, dl))
 	typed := asTyped(t, err)
@@ -407,7 +410,10 @@ func TestDownloadMediaToUrl_SSRF(t *testing.T) {
 	fs := newFakeStorage(t)
 	setupGuard(t, fs, 0)
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error {
+		downloads.Add(1)
+		return nil
+	}
 
 	for _, bad := range []string{
 		"http://" + fs.host(t) + "/plain",
@@ -555,7 +561,10 @@ func TestDownloadMediaToUrl_Busy(t *testing.T) {
 		t.Fatal(err)
 	}
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error {
+		downloads.Add(1)
+		return nil
+	}
 
 	start := time.Now()
 	_, err = downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(1), UploadUrl: fs.uploadURL()}, deps(fs, dl))
@@ -587,7 +596,10 @@ func TestDownloadMediaToUrl_DiskLow(t *testing.T) {
 	_ = seenNeed
 
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error {
+		downloads.Add(1)
+		return nil
+	}
 	// declared 200 + reserve 900 > 1000 free → disk_low, nothing downloaded
 	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(200), UploadUrl: fs.uploadURL()}, deps(fs, dl))
 	typed := asTyped(t, err)

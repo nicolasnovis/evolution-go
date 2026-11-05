@@ -157,3 +157,162 @@ func TestTemMencao(t *testing.T) {
 		t.Fatal("mention expected")
 	}
 }
+
+func TestDefinirContextInfoDoDocumento(t *testing.T) {
+	ci := &waE2E.ContextInfo{StanzaID: proto.String("Q1")}
+
+	// document without caption: top-level DocumentMessage
+	semLegenda := &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("a.pdf")}}
+	definirContextInfoDoDocumento(semLegenda, ci)
+	if semLegenda.DocumentMessage.ContextInfo != ci {
+		t.Fatal("must set the ContextInfo on the top-level DocumentMessage")
+	}
+
+	// document with caption: inner DocumentMessage of the wrapper
+	comLegenda := docComLegenda(nil)
+	definirContextInfoDoDocumento(comLegenda, ci)
+	if comLegenda.GetDocumentWithCaptionMessage().GetMessage().GetDocumentMessage().ContextInfo != ci {
+		t.Fatal("must set the ContextInfo on the inner DocumentMessage")
+	}
+	if comLegenda.DocumentMessage != nil {
+		t.Fatal("top-level DocumentMessage must stay nil")
+	}
+
+	// malformed / empty: must not panic
+	for nome, m := range map[string]*waE2E.Message{
+		"mensagem nil":                        nil,
+		"sem documento":                       {},
+		"wrapper sem Message":                 {DocumentWithCaptionMessage: &waE2E.FutureProofMessage{}},
+		"wrapper sem DocumentMessage interno": {DocumentWithCaptionMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{}}},
+	} {
+		t.Run(nome, func(t *testing.T) {
+			definirContextInfoDoDocumento(m, ci)
+		})
+	}
+}
+
+// mensagemPorTipo builds each message type the way the send builders do (document with caption
+// wrapped, view-once as a flag on the media itself).
+func mensagemPorTipo(tipo string) (*waE2E.Message, string) {
+	switch tipo {
+	case "texto":
+		return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("@all oi")}}, "ExtendedTextMessage"
+	case "imagem":
+		return &waE2E.Message{ImageMessage: &waE2E.ImageMessage{Caption: proto.String("x")}}, "ImageMessage"
+	case "imagem view-once":
+		return &waE2E.Message{ImageMessage: &waE2E.ImageMessage{ViewOnce: proto.Bool(true)}}, "ImageMessage"
+	case "video":
+		return &waE2E.Message{VideoMessage: &waE2E.VideoMessage{}}, "VideoMessage"
+	case "video view-once":
+		return &waE2E.Message{VideoMessage: &waE2E.VideoMessage{ViewOnce: proto.Bool(true)}}, "VideoMessage"
+	case "ptv":
+		return &waE2E.Message{PtvMessage: &waE2E.VideoMessage{}}, "PtvMessage"
+	case "audio":
+		return &waE2E.Message{AudioMessage: &waE2E.AudioMessage{PTT: proto.Bool(true)}}, "AudioMessage"
+	case "doc sem legenda":
+		return &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("a.pdf")}}, "DocumentMessage"
+	case "doc com legenda":
+		return docComLegenda(nil), "DocumentMessage"
+	case "enquete":
+		return &waE2E.Message{PollCreationMessage: &waE2E.PollCreationMessage{Name: proto.String("?")}}, "PollCreationMessage"
+	case "figurinha":
+		return &waE2E.Message{StickerMessage: &waE2E.StickerMessage{}}, "StickerMessage"
+	case "localizacao":
+		return &waE2E.Message{LocationMessage: &waE2E.LocationMessage{}}, "LocationMessage"
+	case "contato":
+		return &waE2E.Message{ContactMessage: &waE2E.ContactMessage{}}, "ContactMessage"
+	}
+	panic("tipo desconhecido: " + tipo)
+}
+
+// contextInfoDoEnvio mirrors the quoted / plain branch of SendMessage (every mention-capable type
+// gets a ContextInfo before the mention step), plus the forwarding step.
+func contextInfoDoEnvio(msg *waE2E.Message, messageType string, citada, encaminhada bool) {
+	novo := func() *waE2E.ContextInfo {
+		if citada {
+			return &waE2E.ContextInfo{StanzaID: proto.String("Q1"), Participant: proto.String("p@s.whatsapp.net")}
+		}
+		return &waE2E.ContextInfo{}
+	}
+	if messageType == "DocumentMessage" {
+		definirContextInfoDoDocumento(msg, novo())
+	} else if ci := contextInfoParaMencao(msg, messageType); ci != nil {
+		*ci = *novo()
+	}
+	if encaminhada {
+		if ci := contextInfoParaMencao(msg, messageType); ci != nil {
+			ci.ForwardingScore = proto.Uint32(1)
+			ci.IsForwarded = proto.Bool(true)
+		}
+	}
+}
+
+func TestAplicarMencoes_MatrizCompleta_NuncaPanicaEMantemComportamento(t *testing.T) {
+	tipos := []string{"texto", "imagem", "imagem view-once", "video", "video view-once", "ptv", "audio",
+		"doc sem legenda", "doc com legenda", "enquete", "figurinha", "localizacao", "contato"}
+	jids := []string{"5521999999999@s.whatsapp.net"}
+	mencoes := map[string]*SendDataStruct{
+		"sem menção":     {},
+		"@todos":         {MentionAll: true},
+		"nomeada":        {MentionedJID: jids},
+		"@todos+nomeada": {MentionAll: true, MentionedJID: jids},
+	}
+	for _, tipo := range tipos {
+		for nomeMencao, base := range mencoes {
+			for _, citada := range []bool{false, true} {
+				for _, encaminhada := range []bool{false, true} {
+					for _, destino := range []string{"120363000000000000@g.us", "5521988887777"} {
+						nome := tipo + "/" + nomeMencao + "/" + destino
+						if citada {
+							nome += "/citada"
+						}
+						if encaminhada {
+							nome += "/encaminhada"
+						}
+						t.Run(nome, func(t *testing.T) {
+							msg, messageType := mensagemPorTipo(tipo)
+							data := *base
+							data.Number = destino
+							contextInfoDoEnvio(msg, messageType, citada, encaminhada)
+							antes := proto.Clone(msg)
+
+							// same gate as SendMessage
+							if destino == "120363000000000000@g.us" {
+								aplicarMencoes(msg, messageType, &data)
+							}
+
+							ci := contextInfoParaMencao(msg, messageType)
+							if ci == nil {
+								t.Fatal("every mention-capable type must carry a ContextInfo here")
+							}
+							ehGrupo := destino == "120363000000000000@g.us"
+							if !ehGrupo || !temMencao(&data) {
+								if !proto.Equal(antes, msg) {
+									t.Fatalf("without a group mention the message must not change:\nbefore %v\nafter  %v", antes, msg)
+								}
+								return
+							}
+							// with a mention: identical to 473d747
+							if data.MentionAll != (ci.GetNonJIDMentions() == 1) {
+								t.Fatalf("NonJIDMentions mismatch: %v", ci.NonJIDMentions)
+							}
+							if len(data.MentionedJID) > 0 {
+								if len(ci.MentionedJID) != 1 || ci.MentionedJID[0] != jids[0] {
+									t.Fatalf("MentionedJID mismatch: %v", ci.MentionedJID)
+								}
+							} else if len(ci.MentionedJID) != 0 {
+								t.Fatalf("@all must not carry a list: %v", ci.MentionedJID)
+							}
+							if citada && ci.GetStanzaID() != "Q1" {
+								t.Fatal("quoted reply must be preserved alongside the mention")
+							}
+							if encaminhada && !ci.GetIsForwarded() {
+								t.Fatal("forwarded flag must be preserved alongside the mention")
+							}
+						})
+					}
+				}
+			}
+		}
+	}
+}

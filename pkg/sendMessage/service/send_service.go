@@ -2602,11 +2602,7 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 		case "AudioMessage":
 			msg.AudioMessage.ContextInfo = data.Quoted.ContextInfo(recipient)
 		case "DocumentMessage":
-			if msg.DocumentMessage != nil {
-				msg.DocumentMessage.ContextInfo = data.Quoted.ContextInfo(recipient)
-			} else if msg.DocumentWithCaptionMessage != nil {
-				msg.DocumentWithCaptionMessage.Message.DocumentMessage.ContextInfo = data.Quoted.ContextInfo(recipient)
-			}
+			definirContextInfoDoDocumento(msg, data.Quoted.ContextInfo(recipient))
 		case "PollCreationMessage":
 			msg.PollCreationMessage.ContextInfo = data.Quoted.ContextInfo(recipient)
 		case "StickerMessage":
@@ -2655,11 +2651,7 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 		case "AudioMessage":
 			msg.AudioMessage.ContextInfo = &waE2E.ContextInfo{}
 		case "DocumentMessage":
-			if msg.DocumentMessage != nil {
-				msg.DocumentMessage.ContextInfo = &waE2E.ContextInfo{}
-			} else if msg.DocumentWithCaptionMessage != nil {
-				msg.DocumentWithCaptionMessage.Message.DocumentMessage.ContextInfo = &waE2E.ContextInfo{}
-			}
+			definirContextInfoDoDocumento(msg, &waE2E.ContextInfo{})
 		case "PollCreationMessage":
 			msg.PollCreationMessage.ContextInfo = &waE2E.ContextInfo{}
 		case "StickerMessage":
@@ -3340,6 +3332,23 @@ func NewSendService(
 		whatsmeowService: whatsmeowService,
 		config:           config,
 		loggerWrapper:    loggerWrapper,
+	}
+}
+
+// definirContextInfoDoDocumento sets the ContextInfo of the document being sent: the top-level
+// DocumentMessage when present, otherwise the DocumentMessage inside DocumentWithCaptionMessage
+// (document with caption). Never dereferences a nil pointer: a wrapper without the inner document
+// is left untouched instead of panicking.
+func definirContextInfoDoDocumento(msg *waE2E.Message, ci *waE2E.ContextInfo) {
+	if msg == nil {
+		return
+	}
+	if msg.DocumentMessage != nil {
+		msg.DocumentMessage.ContextInfo = ci
+		return
+	}
+	if m := msg.GetDocumentWithCaptionMessage().GetMessage().GetDocumentMessage(); m != nil {
+		m.ContextInfo = ci
 	}
 }
 

@@ -100,6 +100,16 @@ func (cli *Client) DownloadMediaWithPathToFile(
 		mmsType = mediaTypeToMMSType[mediaType]
 	}
 	for i, host := range mediaConn.Hosts {
+		if i > 0 {
+			// The previous host may have left a partial download behind (and the file offset at its
+			// end): start the next host on an empty file, otherwise its bytes land after the leftovers
+			// and the hash check fails as if the media were corrupt.
+			if _, err = file.Seek(0, io.SeekStart); err != nil {
+				return fmt.Errorf("failed to seek to start of file before trying next host: %w", err)
+			} else if err = file.Truncate(0); err != nil {
+				return fmt.Errorf("failed to truncate file before trying next host: %w", err)
+			}
+		}
 		// TODO omit hash for unencrypted media?
 		mediaURL := fmt.Sprintf("https://%s%s&hash=%s&mms-type=%s&__wa-mms=", host.Hostname, directPath, base64.URLEncoding.EncodeToString(encFileHash), mmsType)
 		err = cli.downloadAndDecryptToFile(ctx, mediaURL, mediaKey, mediaType, encFileHash, fileHash, file)

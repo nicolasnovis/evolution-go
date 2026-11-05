@@ -40,6 +40,11 @@ const (
 	// pdfThumbMaxSourceBytes: above this a streamed PDF goes without the page-1 preview (the preview
 	// needs the whole file in memory for pdftoppm).
 	pdfThumbMaxSourceBytes = 20 << 20
+	// smallPathMaxBytes caps the IN-MEMORY path whatever SEND_MEDIA_MAX_BYTES says: raising that env
+	// (1 GB for documents) is meant for the streamed path only. Image/audio/ptv/newsletter — and
+	// document/video while streaming is off — keep today's 100 MB ceiling, so a raised cap can never
+	// put a 1 GB file in RAM (~3x with Upload's ciphertext copy: OOM on this VPS).
+	smallPathMaxBytes = 100 << 20
 )
 
 // SendMediaError is the typed failure of /send/media by URL: HTTP status + stable code for the app.
@@ -122,6 +127,15 @@ type sendMediaLimits struct {
 	streamAbove int64 // SEND_MEDIA_STREAM_ABOVE; 0 = streaming off
 	httpClient  *http.Client
 	acquireWait time.Duration
+}
+
+// smallCap is the size cap of the in-memory path: maxBytes, never above smallPathMaxBytes (0 keeps
+// meaning "no cap", today's behaviour).
+func (l sendMediaLimits) smallCap() int64 {
+	if l.maxBytes > smallPathMaxBytes {
+		return smallPathMaxBytes
+	}
+	return l.maxBytes
 }
 
 func (s *sendService) sendMediaLimits() sendMediaLimits {
@@ -217,17 +231,18 @@ func fetchMediaSource(ctx context.Context, rawURL, mediaType string, isNewslette
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		// Unparsable URL: same class as today's http.Get failure (the GET never happened).
-		return nil, newSendMediaError(http.StatusBadGateway, "download_failed", err.Error(), map[string]any{"status": 0})
+		return nil, newSendMediaError(http.StatusBadGateway, "download_failed", mediaguard.RedactURLError(err), map[string]any{"status": 0})
 	}
 	resp, err := lim.httpClient.Do(req)
 	if err != nil {
 		if ce := ctxError(err); ce != nil {
 			return nil, ce
 		}
+		// Never err.Error(): a *url.Error quotes the source URL, and a signed Storage URL carries its token.
 		if errors.Is(err, errRedirectNotAllowed) {
-			return nil, newSendMediaError(http.StatusBadRequest, "url_not_allowed", err.Error(), nil)
+			return nil, newSendMediaError(http.StatusBadRequest, "url_not_allowed", mediaguard.RedactURLError(err), nil)
 		}
-		return nil, newSendMediaError(http.StatusBadGateway, "download_failed", err.Error(), map[string]any{"status": 0})
+		return nil, newSendMediaError(http.StatusBadGateway, "download_failed", mediaguard.RedactURLError(err), map[string]any{"status": 0})
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -245,16 +260,22 @@ func fetchMediaSource(ctx context.Context, rawURL, mediaType string, isNewslette
 
 	useStream := lim.streamAbove > 0 && !isNewsletter && streamableType(mediaType) && (declared < 0 || declared > lim.streamAbove)
 	if !useStream {
+		if c := lim.smallCap(); c > 0 && declared > c {
+			return nil, newSendMediaError(http.StatusRequestEntityTooLarge, "too_large",
+				fmt.Sprintf("declared %d bytes > in-memory cap %d (only streamed document/video may go above it)", declared, c),
+				map[string]any{"declaredBytes": declared, "maxBytes": c})
+		}
 		return readSmall(resp.Body, rawURL, lim)
 	}
 	return readLarge(ctx, resp.Body, rawURL, declared, lim, log)
 }
 
-// readSmall is today's path: whole body in memory, capped at maxBytes.
+// readSmall is today's path: whole body in memory, capped at smallCap (maxBytes, at most 100 MB).
 func readSmall(body io.Reader, rawURL string, lim sendMediaLimits) (*mediaSource, error) {
+	maxBytes := lim.smallCap()
 	r := body
-	if lim.maxBytes > 0 {
-		r = io.LimitReader(body, lim.maxBytes+1)
+	if maxBytes > 0 {
+		r = io.LimitReader(body, maxBytes+1)
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -263,10 +284,10 @@ func readSmall(body io.Reader, rawURL string, lim sendMediaLimits) (*mediaSource
 		}
 		return nil, newSendMediaError(http.StatusBadGateway, "download_failed", "reading source: "+err.Error(), map[string]any{"status": 200})
 	}
-	if lim.maxBytes > 0 && int64(len(data)) > lim.maxBytes {
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
 		return nil, newSendMediaError(http.StatusRequestEntityTooLarge, "too_large",
-			fmt.Sprintf("source larger than SEND_MEDIA_MAX_BYTES %d", lim.maxBytes),
-			map[string]any{"maxBytes": lim.maxBytes})
+			fmt.Sprintf("source larger than the in-memory cap %d", maxBytes),
+			map[string]any{"maxBytes": maxBytes})
 	}
 	mime, _ := mimetype.DetectReader(bytes.NewReader(data))
 	return &mediaSource{data: data, size: int64(len(data)), mimeType: sniffedMime(mime, rawURL)}, nil
@@ -482,7 +503,8 @@ func uploadMediaSource(ctx context.Context, up mediaUploader, src *mediaSource, 
 		if ce := ctxError(err); ce != nil {
 			return uploaded, ce
 		}
-		return uploaded, newSendMediaError(http.StatusBadGateway, "upload_failed", err.Error(), nil)
+		// The WhatsApp upload URL carries the media-conn `auth` credential; keep it out of the body.
+		return uploaded, newSendMediaError(http.StatusBadGateway, "upload_failed", mediaguard.RedactURLError(err), nil)
 	}
 	return uploaded, nil
 }

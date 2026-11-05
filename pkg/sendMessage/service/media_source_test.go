@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -791,6 +792,79 @@ func TestReadLarge_NoCapNoLengthBoundedByDisk(t *testing.T) {
 	_, err := readLarge(context.Background(), io.LimitReader(&patternReader{}, 1<<20), "http://x/doc", -1, lim(0, 1), nil)
 	if typed := asSendErr(t, err); typed.Status != 503 || typed.Code != "disk_low" {
 		t.Fatalf("esperava disk_low: %+v", typed)
+	}
+	assertDirEmpty(t, dir)
+}
+
+// Network failures of the source GET (and a refused redirect) must not echo the signed URL's token.
+func TestFetchMediaSource_ErrorsDoNotLeakToken(t *testing.T) {
+	guardDir(t)
+	srv := sourceServer(t, nil, true, 200)
+	signed := srv.URL + "/storage/v1/object/sign/whatsapp-media/x.pdf?token=SUPERSECRETJWT"
+	srv.Close()
+	_, err := fetchMediaSource(context.Background(), signed, "document", false, lim(0, 0), nil)
+	typed := asSendErr(t, err)
+	if typed.Code != "download_failed" || strings.Contains(typed.Error(), "SUPERSECRETJWT") {
+		t.Fatalf("GET sem rede vazou a URL: %v", typed)
+	}
+
+	// Unparsable URL (control char) — the parse error quotes the raw URL.
+	_, err = fetchMediaSource(context.Background(), "https://h/x?token=SUPERSECRETJWT\x7f", "document", false, lim(0, 0), nil)
+	if typed := asSendErr(t, err); strings.Contains(typed.Error(), "SUPERSECRETJWT") {
+		t.Fatalf("URL inválida vazou: %v", typed)
+	}
+
+	// Upload failure from whatsmeow wraps a *url.Error carrying the media-conn auth.
+	wrapped := &errUploader{err: fmt.Errorf("failed to execute request: %w", &url.Error{Op: "Post", URL: "https://mmg.whatsapp.net/mms/document/t?auth=SUPERSECRETJWT", Err: io.EOF})}
+	_, err = uploadMediaSource(context.Background(), wrapped, &mediaSource{data: []byte("x")}, whatsmeow.MediaDocument, false)
+	if typed := asSendErr(t, err); typed.Code != "upload_failed" || strings.Contains(typed.Error(), "SUPERSECRETJWT") {
+		t.Fatalf("upload_failed vazou o auth: %v", typed)
+	}
+}
+
+type errUploader struct{ err error }
+
+func (e *errUploader) fail() error { return e.err }
+func (e *errUploader) Upload(context.Context, []byte, whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	return whatsmeow.UploadResponse{}, e.fail()
+}
+func (e *errUploader) UploadReader(context.Context, io.Reader, io.ReadWriteSeeker, whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	return whatsmeow.UploadResponse{}, e.fail()
+}
+func (e *errUploader) UploadNewsletter(context.Context, []byte, whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+	return whatsmeow.UploadResponse{}, e.fail()
+}
+
+// SEND_MEDIA_MAX_BYTES raised for the streamed path must not raise the in-memory path: image (never
+// streamed) and document with streaming off stay at 100 MB.
+func TestFetchMediaSource_SmallPathCappedAt100MB(t *testing.T) {
+	dir := guardDir(t)
+	if got := lim(1<<30, 0).smallCap(); got != smallPathMaxBytes {
+		t.Fatalf("smallCap com 1 GB: %d", got)
+	}
+	if got := lim(1000, 0).smallCap(); got != 1000 {
+		t.Fatalf("smallCap abaixo de 100 MB muda: %d", got)
+	}
+	if got := lim(0, 0).smallCap(); got != 0 {
+		t.Fatalf("smallCap 0 = sem teto (hoje): %d", got)
+	}
+
+	// Declared above 100 MB on the small path → 413 before reading a byte (server only declares).
+	declared := int64(smallPathMaxBytes + 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(declared, 10))
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(srv.Close)
+	for _, tc := range []struct {
+		typ   string
+		above int64
+	}{{"image", 33554432}, {"audio", 33554432}, {"document", 0}, {"video", 0}} {
+		_, err := fetchMediaSource(context.Background(), srv.URL+"/x", tc.typ, false, lim(1<<30, tc.above), nil)
+		typed := asSendErr(t, err)
+		if typed.Status != 413 || typed.Code != "too_large" || typed.Extra["maxBytes"] != int64(smallPathMaxBytes) {
+			t.Fatalf("%s acima de 100 MB no caminho em memória: %+v", tc.typ, typed)
+		}
 	}
 	assertDirEmpty(t, dir)
 }

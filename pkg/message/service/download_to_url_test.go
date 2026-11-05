@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -701,4 +702,58 @@ func TestMediaToUrlError_Fields(t *testing.T) {
 	if (&MediaToUrlError{Code: "busy"}).Error() != "busy" {
 		t.Fatal("sem detalhe = só o código")
 	}
+}
+
+// The PUT failing at the network level must not echo the signed upload URL (its token) in the JSON
+// error nor in the log line.
+func TestDownloadMediaToUrl_NetworkErrorDoesNotLeakToken(t *testing.T) {
+	fs := newFakeStorage(t)
+	dir := setupGuard(t, fs, 0)
+	signed := fs.srv.URL + "/storage/v1/object/upload/sign/whatsapp-media/acc/ID.pdf?token=SUPERSECRETJWT"
+	fs.srv.Close()
+
+	logs := &captureLog{}
+	d := deps(fs, writeN(50))
+	d.log = logs
+	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(50), UploadUrl: signed}, d)
+	typed := asTyped(t, err)
+	if typed.Status != 502 || typed.Code != "storage_rejected" || typed.Extra["status"] != 0 {
+		t.Fatalf("PUT sem rede: %+v", typed)
+	}
+	body := fmt.Sprint(typed.Fields())
+	if strings.Contains(body, "SUPERSECRETJWT") || strings.Contains(body, "/upload/sign/") {
+		t.Fatalf("URL assinada vazou no JSON: %s", body)
+	}
+	if !strings.Contains(body, fs.host(t)) {
+		t.Fatalf("o host deveria aparecer pra diagnóstico: %s", body)
+	}
+	if strings.Contains(logs.all(), "SUPERSECRETJWT") {
+		t.Fatalf("URL assinada vazou no log: %s", logs.all())
+	}
+	assertDirEmpty(t, dir)
+
+	// A download error that wraps a *url.Error (CDN URL with its own signed params) is redacted too.
+	mapped := classifyDownloadError(fmt.Errorf("failed to download: %w", &url.Error{Op: "Get", URL: "https://mmg.whatsapp.net/v/x?oh=SUPERSECRETJWT", Err: errors.New("EOF")}))
+	if mapped.Code != "download_failed" || strings.Contains(mapped.Error(), "SUPERSECRETJWT") {
+		t.Fatalf("download_failed vazou a URL: %v", mapped)
+	}
+}
+
+type captureLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (c *captureLog) add(format string, args ...interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fmt.Fprintf(&c.buf, format+"\n", args...)
+}
+func (c *captureLog) LogInfo(f string, a ...interface{})  { c.add(f, a...) }
+func (c *captureLog) LogWarn(f string, a ...interface{})  { c.add(f, a...) }
+func (c *captureLog) LogError(f string, a ...interface{}) { c.add(f, a...) }
+func (c *captureLog) all() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
 }

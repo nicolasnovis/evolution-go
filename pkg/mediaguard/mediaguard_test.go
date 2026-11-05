@@ -3,8 +3,11 @@ package mediaguard
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -268,5 +271,35 @@ func TestReserveDisk_CountsInFlightAndReleases(t *testing.T) {
 	SetDiskProbe(func(string) (uint64, error) { return 0, errors.New("statfs boom") })
 	if _, _, err := ReserveDisk(0); !errors.Is(err, ErrDiskLow) {
 		t.Fatalf("probe falhando fecha a porta: %v", err)
+	}
+}
+
+func TestRedactURLError(t *testing.T) {
+	signed := "https://proj.storage.supabase.co/storage/v1/object/upload/sign/b/x.pdf?token=SECRET123"
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"nil", nil, ""},
+		{"plain", errors.New("boom"), "boom"},
+		{"url error keeps op+host+cause", &url.Error{Op: "Put", URL: signed, Err: errors.New("connection refused")}, "Put proj.storage.supabase.co: connection refused"},
+		{"wrapped url error", fmt.Errorf("failed to execute request: %w", &url.Error{Op: "Post", URL: "https://mmg.whatsapp.net/mms/document/x?auth=SECRET123&token=t", Err: errors.New("EOF")}), "Post mmg.whatsapp.net: EOF"},
+	}
+	for _, c := range cases {
+		got := RedactURLError(c.err)
+		if got != c.want {
+			t.Fatalf("%s: got %q want %q", c.name, got, c.want)
+		}
+		if strings.Contains(got, "SECRET123") {
+			t.Fatalf("%s: token vazou: %q", c.name, got)
+		}
+	}
+
+	// url.Parse failure inside ValidateStorageURL must not echo the raw URL.
+	resetForTest(t, Settings{AllowedHosts: []string{"proj.storage.supabase.co"}})
+	_, err := ValidateStorageURL("https://proj.storage.supabase.co/x?token=SECRET123\x7f")
+	if err == nil || !errors.Is(err, ErrURLNotAllowed) || strings.Contains(err.Error(), "SECRET123") {
+		t.Fatalf("parse error vazou a URL: %v", err)
 	}
 }

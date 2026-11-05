@@ -352,7 +352,8 @@ func ValidateStorageURL(raw string) (*url.URL, error) {
 	}
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrURLNotAllowed, err)
+		// url.Parse errors quote the whole raw URL (token included); keep only the cause.
+		return nil, fmt.Errorf("%w: %s", ErrURLNotAllowed, RedactURLError(err))
 	}
 	if !strings.EqualFold(u.Scheme, "https") {
 		return nil, fmt.Errorf("%w: scheme %q (https only)", ErrURLNotAllowed, u.Scheme)
@@ -368,4 +369,27 @@ func ValidateStorageURL(raw string) (*url.URL, error) {
 		}
 	}
 	return nil, fmt.Errorf("%w: host %q not in MEDIA_UPLOAD_ALLOWED_HOSTS", ErrURLNotAllowed, hostname)
+}
+
+// RedactURLError renders err without the request URL. A *url.Error (anywhere in the chain) prints
+// the full URL, and signed URLs carry their credential in the query string (Storage `token`,
+// WhatsApp upload `auth`), which must never reach a JSON error body or a log line. For those it
+// returns "<op> <host>: <cause>" (host only when the URL parses); any other error is unchanged.
+func RedactURLError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err.Error()
+	}
+	cause := "unknown error"
+	if ue.Err != nil {
+		cause = RedactURLError(ue.Err)
+	}
+	prefix := ue.Op
+	if u, perr := url.Parse(ue.URL); perr == nil && u.Host != "" {
+		prefix += " " + u.Host
+	}
+	return prefix + ": " + cause
 }

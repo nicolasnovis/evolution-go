@@ -274,7 +274,7 @@ func classifyDownloadError(err error) *MediaToUrlError {
 	case errors.Is(err, context.Canceled):
 		return newMediaToUrlError(499, "canceled", "request canceled by the caller", nil)
 	}
-	return newMediaToUrlError(http.StatusBadGateway, "download_failed", err.Error(), nil)
+	return newMediaToUrlError(http.StatusBadGateway, "download_failed", mediaguard.RedactURLError(err), nil)
 }
 
 // downloadMediaToUrl is the whole pipeline (steps numbered as in the plan, section A.1).
@@ -380,7 +380,7 @@ func downloadMediaToUrl(parent context.Context, data *DownloadMediaToUrlStruct, 
 				fmt.Sprintf("download crossed the free disk headroom (%d bytes)", writeLimit), nil)
 		}
 		mapped := classifyDownloadError(err)
-		deps.log.LogWarn("downloadmedia-to-url: download failed (%s) kind=%s declared=%d: %v", mapped.Code, node.kind, node.fileLength, err)
+		deps.log.LogWarn("downloadmedia-to-url: download failed (%s) kind=%s declared=%d: %s", mapped.Code, node.kind, node.fileLength, mediaguard.RedactURLError(err))
 		return nil, mapped
 	}
 	downloadMs := time.Since(downloadStart).Milliseconds()
@@ -446,7 +446,7 @@ func putFileToURL(ctx context.Context, client *http.Client, f *os.File, size int
 	hasher := sha256.New()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadUrl, io.TeeReader(f, hasher))
 	if err != nil {
-		return "", newMediaToUrlError(http.StatusBadRequest, "upload_url_not_allowed", err.Error(), nil)
+		return "", newMediaToUrlError(http.StatusBadRequest, "upload_url_not_allowed", mediaguard.RedactURLError(err), nil)
 	}
 	req.ContentLength = size
 	// If the transport has to replay the request (stale keep-alive), rewind the file and the hash.
@@ -476,7 +476,8 @@ func putFileToURL(ctx context.Context, client *http.Client, f *os.File, size int
 		case errors.Is(err, context.Canceled):
 			return "", newMediaToUrlError(499, "canceled", "request canceled by the caller", nil)
 		}
-		return "", newMediaToUrlError(http.StatusBadGateway, "storage_rejected", "PUT failed: "+err.Error(), map[string]any{"status": 0})
+		// Never err.Error(): a *url.Error quotes the signed upload URL, token included.
+		return "", newMediaToUrlError(http.StatusBadGateway, "storage_rejected", "PUT failed: "+mediaguard.RedactURLError(err), map[string]any{"status": 0})
 	}
 	defer resp.Body.Close()
 	preview, _ := io.ReadAll(io.LimitReader(resp.Body, storageBodyPreviewBytes))

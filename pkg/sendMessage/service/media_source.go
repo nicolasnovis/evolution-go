@@ -85,8 +85,11 @@ func (noopSendLog) LogWarn(string, ...interface{})  {}
 func (noopSendLog) LogError(string, ...interface{}) {}
 
 // sourceHTTPClient fetches the media URL: no Client.Timeout (the ctx bounds the whole send), but every
-// phase that can hang has its own limit.
+// phase that can hang has its own limit. Redirects follow today's rule (up to 10), except that with
+// MEDIA_UPLOAD_ALLOWED_HOSTS set every hop must pass the same allow-list as the original URL —
+// otherwise an allowed host could bounce the engine to an internal address.
 var sourceHTTPClient = &http.Client{
+	CheckRedirect: checkSourceRedirect,
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -96,6 +99,21 @@ var sourceHTTPClient = &http.Client{
 		MaxIdleConns:          8,
 		IdleConnTimeout:       90 * time.Second,
 	},
+}
+
+// errRedirectNotAllowed marks a redirect refused by checkSourceRedirect (answered 400 url_not_allowed).
+var errRedirectNotAllowed = errors.New("redirect target not allowed")
+
+func checkSourceRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if mediaguard.HostsConfigured() {
+		if _, err := mediaguard.ValidateStorageURL(req.URL.String()); err != nil {
+			return fmt.Errorf("%w: %v", errRedirectNotAllowed, err)
+		}
+	}
+	return nil
 }
 
 // sendMediaLimits are the knobs fetchMediaSource obeys (from config.Config in production).
@@ -117,12 +135,13 @@ func (s *sendService) sendMediaLimits() sendMediaLimits {
 
 // mediaSource is the fetched file: in memory (small path) or on disk (large path).
 type mediaSource struct {
-	data     []byte
-	file     *os.File
-	size     int64
-	mimeType string
-	release  func()
-	closed   bool
+	data        []byte
+	file        *os.File
+	size        int64
+	mimeType    string
+	release     func() // send slot
+	releaseDisk func() // disk reservation, freed after the temp file is gone
+	closed      bool
 }
 
 func (m *mediaSource) streamed() bool { return m != nil && m.file != nil }
@@ -135,6 +154,9 @@ func (m *mediaSource) Close() {
 	m.closed = true
 	mediaguard.RemoveTemp(m.file)
 	m.file = nil
+	if m.releaseDisk != nil {
+		m.releaseDisk()
+	}
 	if m.release != nil {
 		m.release()
 	}
@@ -194,12 +216,16 @@ func fetchMediaSource(ctx context.Context, rawURL, mediaType string, isNewslette
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, newSendMediaError(http.StatusBadRequest, "url_not_allowed", err.Error(), nil)
+		// Unparsable URL: same class as today's http.Get failure (the GET never happened).
+		return nil, newSendMediaError(http.StatusBadGateway, "download_failed", err.Error(), map[string]any{"status": 0})
 	}
 	resp, err := lim.httpClient.Do(req)
 	if err != nil {
 		if ce := ctxError(err); ce != nil {
 			return nil, ce
+		}
+		if errors.Is(err, errRedirectNotAllowed) {
+			return nil, newSendMediaError(http.StatusBadRequest, "url_not_allowed", err.Error(), nil)
 		}
 		return nil, newSendMediaError(http.StatusBadGateway, "download_failed", err.Error(), map[string]any{"status": 0})
 	}
@@ -258,11 +284,13 @@ func readLarge(ctx context.Context, body io.Reader, rawURL string, declared int6
 		}
 		return nil, newSendMediaError(http.StatusServiceUnavailable, "busy", err.Error(), nil)
 	}
-	// `cur` (not the named result) is what the defer cleans: a `return nil, err` already zeroed `src`
-	// by the time the defer runs, and the temp file + slot would leak.
+	// `cur` (not the named result) is what the defer cleans, and it runs on EVERY exit that did not
+	// hand `cur` to the caller — including a panic (gin recovers it and the process lives on; a leaked
+	// slot would answer 503 busy to every large send from then on).
 	cur := &mediaSource{release: release}
+	handedOver := false
 	defer func() {
-		if err != nil {
+		if !handedOver {
 			cur.Close()
 		}
 	}()
@@ -271,19 +299,27 @@ func readLarge(ctx context.Context, body io.Reader, rawURL string, declared int6
 	if need < 0 {
 		need = lim.maxBytes
 	}
-	if derr := mediaguard.EnsureDiskFor(need); derr != nil {
+	releaseDisk, headroom, derr := mediaguard.ReserveDisk(need)
+	if derr != nil {
 		log.LogWarn("send/media: %v", derr)
 		return nil, newSendMediaError(http.StatusServiceUnavailable, "disk_low", derr.Error(), nil)
 	}
+	cur.releaseDisk = releaseDisk
 	f, cerr := mediaguard.CreateTemp(mediaguard.TempPrefixSend)
 	if cerr != nil {
 		return nil, newSendMediaError(http.StatusServiceUnavailable, "disk_low", "cannot create temp file: "+cerr.Error(), nil)
 	}
 	cur.file = f
 
+	// Size cap while copying: SEND_MEDIA_MAX_BYTES, or — only when it is 0 and the source sent no
+	// Content-Length — the free-disk headroom (a chunked body is never written unbounded).
 	r := body
+	diskCapped := false
 	if lim.maxBytes > 0 {
 		r = io.LimitReader(body, lim.maxBytes+1)
+	} else if declared < 0 {
+		r = io.LimitReader(body, headroom+1)
+		diskCapped = true
 	}
 	n, cpErr := io.Copy(f, r)
 	if cpErr != nil {
@@ -296,6 +332,10 @@ func readLarge(ctx context.Context, body io.Reader, rawURL string, declared int6
 		return nil, newSendMediaError(http.StatusRequestEntityTooLarge, "too_large",
 			fmt.Sprintf("source larger than SEND_MEDIA_MAX_BYTES %d", lim.maxBytes),
 			map[string]any{"declaredBytes": declared, "maxBytes": lim.maxBytes})
+	}
+	if diskCapped && n > headroom {
+		return nil, newSendMediaError(http.StatusServiceUnavailable, "disk_low",
+			fmt.Sprintf("source crossed the free disk headroom (%d bytes)", headroom), nil)
 	}
 	if declared >= 0 && n != declared {
 		return nil, newSendMediaError(http.StatusBadGateway, "download_failed",
@@ -311,6 +351,7 @@ func readLarge(ctx context.Context, body io.Reader, rawURL string, declared int6
 		return nil, newSendMediaError(http.StatusInternalServerError, "internal", "seek: "+serr.Error(), nil)
 	}
 	cur.mimeType = sniffedMime(mime, rawURL)
+	handedOver = true
 	return cur, nil
 }
 

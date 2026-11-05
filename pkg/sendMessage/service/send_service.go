@@ -1310,14 +1310,20 @@ func (s *sendService) SendMediaUrl(ctx context.Context, data *MediaStruct, insta
 
 // sendMediaUrlWithRetry: session → GET the url ONCE (memory or temp file, see media_source.go) →
 // validate/convert/previews → upload ONCE → build the proto → SendMessage, retried only when the
-// session drops. ctx is the request context bounded by SEND_MEDIA_TIMEOUT: when the app gives up,
-// download and upload stop instead of running to completion for nobody.
+// session drops.
+//
+// The work is DETACHED from the caller's cancellation and bounded only by SEND_MEDIA_TIMEOUT. That is
+// today's behaviour and the app is built on it: when its fetch gives up (85 s) it shows "may have
+// been sent, check before resending" and the message that the engine finishes later is reconciled by
+// the webhook. Aborting the transfer when the app disconnects would turn every such send into a
+// silent loss.
 func (s *sendService) sendMediaUrlWithRetry(ctx context.Context, data *MediaStruct, instance *instance_model.Instance, maxRetries int) (*MessageSendStruct, error) {
 	log := s.loggerWrapper.GetLogger(instance.Id)
 	startTime := time.Now()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = context.WithoutCancel(ctx)
 	if s.config != nil && s.config.SendMediaTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.config.SendMediaTimeout)

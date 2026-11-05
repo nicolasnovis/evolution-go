@@ -693,3 +693,104 @@ func TestSendMediaError_Fields(t *testing.T) {
 		t.Fatal("isDisconnectError")
 	}
 }
+
+// ---- review fixes (redirects, panic safety, disk reservation) -----------------------------------
+
+// With MEDIA_UPLOAD_ALLOWED_HOSTS set, a redirect from an allowed host to anywhere else is refused
+// (400 url_not_allowed) and the other host is never contacted; without the list, redirects are
+// followed as today.
+func TestFetchMediaSource_RedirectMustStayOnAllowList(t *testing.T) {
+	var evilHits int
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		evilHits++
+		_, _ = w.Write(patternBytes(10))
+	}))
+	t.Cleanup(evil.Close)
+	redir := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, evil.URL+"/internal", http.StatusFound)
+	}))
+	t.Cleanup(redir.Close)
+	u, _ := url.Parse(redir.URL)
+
+	guardDir(t, u.Host)
+	l := lim(0, 0)
+	l.httpClient = redir.Client()
+	l.httpClient.CheckRedirect = sourceHTTPClient.CheckRedirect
+	_, err := fetchMediaSource(context.Background(), redir.URL+"/x", "document", false, l, nil)
+	if typed := asSendErr(t, err); typed.Status != 400 || typed.Code != "url_not_allowed" {
+		t.Fatalf("redirect pra fora da lista: %+v", typed)
+	}
+	if evilHits != 0 {
+		t.Fatal("seguiu o redirect pra um host fora da lista")
+	}
+
+	// no list: today's behaviour, the redirect is followed
+	guardDir(t)
+	src, err := fetchMediaSource(context.Background(), redir.URL+"/x", "document", false, l, nil)
+	if err != nil || evilHits != 1 {
+		t.Fatalf("sem lista devia seguir o redirect: hits=%d err=%v", evilHits, err)
+	}
+	src.Close()
+}
+
+type panicReader struct{ after int }
+
+func (p *panicReader) Read(b []byte) (int, error) {
+	if p.after <= 0 {
+		panic("boom mid-copy")
+	}
+	n := min(len(b), p.after)
+	p.after -= n
+	return n, nil
+}
+
+// A panic while copying the source must still free the send slot, the disk reservation and the temp
+// file (gin recovers panics: a leaked slot would answer busy to every large send afterwards).
+func TestReadLarge_PanicFreesSlotDiskAndTemp(t *testing.T) {
+	dir := guardDir(t)
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("esperava panic")
+			}
+		}()
+		_, _ = readLarge(context.Background(), &panicReader{after: 5000}, "http://x/doc", 10000, lim(0, 1), nil)
+	}()
+	assertDirEmpty(t, dir)
+	if mediaguard.DiskReserved() != 0 {
+		t.Fatalf("reserva de disco vazou: %d", mediaguard.DiskReserved())
+	}
+	rel, err := mediaguard.AcquireSendWithin(context.Background(), 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("vaga de envio vazou depois do panic: %v", err)
+	}
+	rel()
+}
+
+// The disk reservation is held while the source lives and released by Close.
+func TestReadLarge_DiskReservationHeldUntilClose(t *testing.T) {
+	dir := guardDir(t)
+	src, err := readLarge(context.Background(), bytes.NewReader(patternBytes(3000)), "http://x/doc", 3000, lim(0, 1), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mediaguard.DiskReserved() != 3000 {
+		t.Fatalf("reserva durante o envio = %d", mediaguard.DiskReserved())
+	}
+	src.Close()
+	if mediaguard.DiskReserved() != 0 {
+		t.Fatalf("reserva depois do Close = %d", mediaguard.DiskReserved())
+	}
+	assertDirEmpty(t, dir)
+}
+
+// SEND_MEDIA_MAX_BYTES=0 and no Content-Length: the copy stops at the free-disk headroom.
+func TestReadLarge_NoCapNoLengthBoundedByDisk(t *testing.T) {
+	dir := guardDir(t)
+	mediaguard.SetDiskProbe(func(string) (uint64, error) { return 1000, nil })
+	_, err := readLarge(context.Background(), io.LimitReader(&patternReader{}, 1<<20), "http://x/doc", -1, lim(0, 1), nil)
+	if typed := asSendErr(t, err); typed.Status != 503 || typed.Code != "disk_low" {
+		t.Fatalf("esperava disk_low: %+v", typed)
+	}
+	assertDirEmpty(t, dir)
+}

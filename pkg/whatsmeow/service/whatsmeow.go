@@ -1925,7 +1925,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 						mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Base64 encoding completed - ID: %s, Original: %d bytes, Encoded: %d chars, Duration: %v", mycli.userID, evt.Info.ID, len(data), len(encodeData), encodeDuration)
 						messageMap["base64"] = encodeData
 					}
-				} else {
+				} else if !skipDownload {
+					// A skipped download (above the cap or MEDIA_AUTODOWNLOAD=off) was already logged above;
+					// warning "download failure" for every received media would bury the real failures.
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Skipping media storage due to download failure - ID: %s", mycli.userID, evt.Info.ID)
 				}
 

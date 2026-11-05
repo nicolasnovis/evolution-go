@@ -2754,19 +2754,7 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 
 	// Mentions only make sense in actual groups, not newsletters
 	if isGroup && !isNewsletter {
-		// @all/@todos like WhatsApp itself sends it (seen on a real phone message, 27/10): the text keeps
-		// "@all" and contextInfo carries nonJIDMentions=1 — no participant list. The old way (every
-		// participant JID hidden in mentionedJID, no matching "@..." tokens in the text) showed a plain
-		// "@all" on the phones and the notification was unreliable.
-		// Named mentions are ADDED next to it; before, they replaced the @all list.
-		if ci := contextInfoParaMencao(msg, messageType); ci != nil {
-			if data.MentionAll {
-				ci.NonJIDMentions = proto.Uint32(1)
-			}
-			if len(data.MentionedJID) > 0 {
-				ci.MentionedJID = data.MentionedJID
-			}
-		}
+		aplicarMencoes(msg, messageType, data)
 	}
 
 	recipient.User = strings.ReplaceAll(recipient.User, "+", "")
@@ -3355,9 +3343,45 @@ func NewSendService(
 	}
 }
 
+// temMencao reports whether the request asks for any group mention (@all and/or named JIDs).
+func temMencao(data *SendDataStruct) bool {
+	return data != nil && (data.MentionAll || len(data.MentionedJID) > 0)
+}
+
+// aplicarMencoes writes the requested group mentions into the ContextInfo of the message being sent.
+//
+// @all/@todos like WhatsApp itself sends it (seen on a real phone message, 27/10): the text keeps
+// "@all" and contextInfo carries nonJIDMentions=1 — no participant list. The old way (every
+// participant JID hidden in mentionedJID, no matching "@..." tokens in the text) showed a plain
+// "@all" on the phones and the notification was unreliable.
+// Named mentions are ADDED next to it; before, they replaced the @all list.
+//
+// Without any mention the message is left untouched: a message with no mention must never fail
+// because of this step (a document with caption travels wrapped in DocumentWithCaptionMessage and
+// used to hit a nil DocumentMessage here, taking the whole group send down with a 500).
+func aplicarMencoes(msg *waE2E.Message, messageType string, data *SendDataStruct) {
+	if !temMencao(data) {
+		return
+	}
+	ci := contextInfoParaMencao(msg, messageType)
+	if ci == nil {
+		return
+	}
+	if data.MentionAll {
+		ci.NonJIDMentions = proto.Uint32(1)
+	}
+	if len(data.MentionedJID) > 0 {
+		ci.MentionedJID = data.MentionedJID
+	}
+}
+
 // contextInfoParaMencao returns the ContextInfo of the message being sent (creating it when missing),
-// for the message types that carry mentions; nil for any other type.
+// for the message types that carry mentions; nil for any other type and nil when the message of the
+// given type is not actually set (never dereferences a nil inner message).
 func contextInfoParaMencao(msg *waE2E.Message, messageType string) *waE2E.ContextInfo {
+	if msg == nil {
+		return nil
+	}
 	garantir := func(ci **waE2E.ContextInfo) *waE2E.ContextInfo {
 		if *ci == nil {
 			*ci = &waE2E.ContextInfo{}
@@ -3366,25 +3390,50 @@ func contextInfoParaMencao(msg *waE2E.Message, messageType string) *waE2E.Contex
 	}
 	switch messageType {
 	case "ExtendedTextMessage":
-		return garantir(&msg.ExtendedTextMessage.ContextInfo)
+		if m := msg.ExtendedTextMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "ImageMessage":
-		return garantir(&msg.ImageMessage.ContextInfo)
+		if m := msg.ImageMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "VideoMessage":
-		return garantir(&msg.VideoMessage.ContextInfo)
+		if m := msg.VideoMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "PtvMessage":
-		return garantir(&msg.PtvMessage.ContextInfo)
+		if m := msg.PtvMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "AudioMessage":
-		return garantir(&msg.AudioMessage.ContextInfo)
+		if m := msg.AudioMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "DocumentMessage":
-		return garantir(&msg.DocumentMessage.ContextInfo)
+		if m := msg.DocumentMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
+		// Document with caption is sent wrapped in DocumentWithCaptionMessage (see SendMediaFile /
+		// sendMediaUrlWithRetry); the inner DocumentMessage is the one that carries the ContextInfo.
+		if m := msg.GetDocumentWithCaptionMessage().GetMessage().GetDocumentMessage(); m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "PollCreationMessage":
-		return garantir(&msg.PollCreationMessage.ContextInfo)
+		if m := msg.PollCreationMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "StickerMessage":
-		return garantir(&msg.StickerMessage.ContextInfo)
+		if m := msg.StickerMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "LocationMessage":
-		return garantir(&msg.LocationMessage.ContextInfo)
+		if m := msg.LocationMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	case "ContactMessage":
-		return garantir(&msg.ContactMessage.ContextInfo)
+		if m := msg.ContactMessage; m != nil {
+			return garantir(&m.ContextInfo)
+		}
 	}
 	return nil
 }

@@ -281,6 +281,54 @@ func EnsureDiskFor(need int64) error {
 	return nil
 }
 
+var (
+	diskMu       sync.Mutex
+	diskReserved uint64 // bytes promised to in-flight operations (ReserveDisk), not yet released
+)
+
+// ReserveDisk is EnsureDiskFor made safe for concurrent operations: the check counts what the other
+// in-flight operations were promised (two downloads that each see "enough" can no longer both eat the
+// same free space), and the promise lasts until release is called — call it AFTER the temp file is
+// removed. need < 0 is treated as 0.
+//
+// headroom is how much the caller may write without eating into the reserve or another operation's
+// promise (>= need on success). Callers cap their writes with it, so a size that lies (a proto that
+// declares 1 KB for a 2 GB file, a source without Content-Length) cannot fill the disk.
+func ReserveDisk(need int64) (release func(), headroom int64, err error) {
+	if need < 0 {
+		need = 0
+	}
+	diskMu.Lock()
+	defer diskMu.Unlock()
+	free, perr := diskProbe(TmpDir())
+	if perr != nil {
+		return func() {}, 0, fmt.Errorf("%w: statfs %s: %v", ErrDiskLow, TmpDir(), perr)
+	}
+	required := uint64(need) + uint64(minFreeBytes) + diskReserved
+	if free < required {
+		return func() {}, 0, fmt.Errorf("%w: %d free, %d required (%d file + %d reserve + %d in flight)",
+			ErrDiskLow, free, required, need, minFreeBytes, diskReserved)
+	}
+	headroom = int64(free - uint64(minFreeBytes) - diskReserved)
+	diskReserved += uint64(need)
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			diskMu.Lock()
+			diskReserved -= uint64(need)
+			diskMu.Unlock()
+		})
+	}
+	return release, headroom, nil
+}
+
+// DiskReserved reports the bytes currently promised to in-flight operations (tests and logs).
+func DiskReserved() uint64 {
+	diskMu.Lock()
+	defer diskMu.Unlock()
+	return diskReserved
+}
+
 // SetDiskProbe swaps the free-space probe (tests). Returns the previous probe so it can be restored.
 func SetDiskProbe(p func(dir string) (uint64, error)) (previous func(dir string) (uint64, error)) {
 	previous = diskProbe

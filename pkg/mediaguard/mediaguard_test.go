@@ -230,3 +230,43 @@ func TestInitStreaming_FallsBackWhenDirUnusable(t *testing.T) {
 		t.Fatalf("devia cair no os.TempDir, ficou %s", TmpDir())
 	}
 }
+
+func TestReserveDisk_CountsInFlightAndReleases(t *testing.T) {
+	resetForTest(t, Settings{MinFreeBytes: 100})
+	SetDiskProbe(func(string) (uint64, error) { return 400, nil })
+
+	r1, head1, err := ReserveDisk(150)
+	if err != nil || head1 != 300 {
+		t.Fatalf("1ª reserva: head=%d err=%v", head1, err)
+	}
+	// 150 + 100 reserve + 150 in flight = 400 → still fits; a third one does not.
+	r2, head2, err := ReserveDisk(150)
+	if err != nil || head2 != 150 {
+		t.Fatalf("2ª reserva: head=%d err=%v", head2, err)
+	}
+	if _, _, err := ReserveDisk(1); !errors.Is(err, ErrDiskLow) {
+		t.Fatalf("sem espaço com 300 em andamento devia dar ErrDiskLow: %v", err)
+	}
+	if DiskReserved() != 300 {
+		t.Fatalf("reservado = %d", DiskReserved())
+	}
+	r1()
+	r1() // double release is harmless
+	if DiskReserved() != 150 {
+		t.Fatalf("depois de soltar uma: %d", DiskReserved())
+	}
+	r2()
+	if DiskReserved() != 0 {
+		t.Fatalf("tudo solto: %d", DiskReserved())
+	}
+	// unknown size (0) still gets a headroom to cap its writes
+	r3, head3, err := ReserveDisk(0)
+	if err != nil || head3 != 300 {
+		t.Fatalf("tamanho desconhecido: head=%d err=%v", head3, err)
+	}
+	r3()
+	SetDiskProbe(func(string) (uint64, error) { return 0, errors.New("statfs boom") })
+	if _, _, err := ReserveDisk(0); !errors.Is(err, ErrDiskLow) {
+		t.Fatalf("probe falhando fecha a porta: %v", err)
+	}
+}

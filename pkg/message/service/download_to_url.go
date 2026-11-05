@@ -106,8 +106,64 @@ func (noopMediaLog) LogWarn(string, ...interface{})  {}
 func (noopMediaLog) LogError(string, ...interface{}) {}
 
 // downloadToFileFunc is client.DownloadToFile behind an indirection so the pipeline is testable
-// without a WhatsApp session.
-type downloadToFileFunc func(ctx context.Context, msg whatsmeow.DownloadableMessage, f *os.File) error
+// without a WhatsApp session. f is the temp file behind a write cap (cappedFile).
+type downloadToFileFunc func(ctx context.Context, msg whatsmeow.DownloadableMessage, f whatsmeow.File) error
+
+// encOverheadBytes is the slack between the plaintext cap and what lands in the temp file while
+// downloading: AES-CBC padding (1-16 bytes) + the 10-byte MAC, rounded up.
+const encOverheadBytes = 64
+
+// errWriteCap is returned by cappedFile once a write would cross its limit.
+var errWriteCap = errors.New("media download crossed the write cap")
+
+// cappedFile is the temp file as whatsmeow sees it during DownloadToFile, refusing any write past
+// limit bytes. The proto's fileLength is set by the SENDER and the CDN Content-Length is not checked
+// against it, so without this a media that declares 1 KB could write gigabytes. Not being an
+// *os.File also skips whatsmeow's fallocate(Content-Length), which would reserve the whole declared
+// size up front. The first refused write cancels the download (onCap) so whatsmeow does not retry
+// the next CDN host and download the same oversized file again.
+type cappedFile struct {
+	*os.File
+	limit    int64
+	exceeded bool
+	onCap    func()
+}
+
+func (c *cappedFile) refuse() error {
+	if !c.exceeded {
+		c.exceeded = true
+		if c.onCap != nil {
+			c.onCap()
+		}
+	}
+	return errWriteCap
+}
+
+func (c *cappedFile) Write(p []byte) (int, error) {
+	pos, err := c.File.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	if pos+int64(len(p)) > c.limit {
+		return 0, c.refuse()
+	}
+	return c.File.Write(p)
+}
+
+// ReadFrom and WriteString shadow the *os.File methods promoted by the embedding: io.Copy (which
+// whatsmeow uses to fill the file) prefers dst.ReadFrom, and the promoted one would bypass the cap.
+func (c *cappedFile) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(struct{ io.Writer }{c}, r)
+}
+
+func (c *cappedFile) WriteString(s string) (int, error) { return c.Write([]byte(s)) }
+
+func (c *cappedFile) WriteAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) > c.limit {
+		return 0, c.refuse()
+	}
+	return c.File.WriteAt(p, off)
+}
 
 type mediaToUrlDeps struct {
 	download    downloadToFileFunc
@@ -118,8 +174,11 @@ type mediaToUrlDeps struct {
 }
 
 // storageHTTPClient is the dedicated client for the PUT: no Client.Timeout (the ctx bounds the whole
-// operation), but every phase that can hang has its own limit.
+// operation), but every phase that can hang has its own limit. Redirects are never followed: a 307/308
+// would replay the PUT (body included, GetBody is set) to a host that was never checked against
+// MEDIA_UPLOAD_ALLOWED_HOSTS; the 3xx comes back as storage_rejected instead.
 var storageHTTPClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -275,15 +334,19 @@ func downloadMediaToUrl(parent context.Context, data *DownloadMediaToUrlStruct, 
 	}
 	defer release()
 
-	// 6. disk guard — unknown size reserves the cap (worst case)
+	// 6. disk guard — reserves the cap when there is one (the declared size comes from the sender and
+	// may lie), else the declared size; the reservation counts the other in-flight operations and is
+	// held until the temp file is gone (deferred before RemoveTemp, so it runs after it).
 	need := node.fileLength
-	if need <= 0 {
+	if data.MaxBytes > 0 {
 		need = data.MaxBytes
 	}
-	if err := mediaguard.EnsureDiskFor(need); err != nil {
+	releaseDisk, headroom, err := mediaguard.ReserveDisk(need)
+	if err != nil {
 		deps.log.LogWarn("downloadmedia-to-url: %v", err)
 		return nil, newMediaToUrlError(http.StatusServiceUnavailable, "disk_low", err.Error(), nil)
 	}
+	defer releaseDisk()
 
 	// 7. temp file — removed on every exit (success, error, panic unwinding)
 	f, err := mediaguard.CreateTemp(mediaguard.TempPrefixReceive)
@@ -292,8 +355,30 @@ func downloadMediaToUrl(parent context.Context, data *DownloadMediaToUrlStruct, 
 	}
 	defer mediaguard.RemoveTemp(f)
 
+	// Write cap: maxBytes (+ cipher overhead) when the app sent one, never more than the disk headroom.
+	writeLimit := headroom
+	capIsMax := false
+	if data.MaxBytes > 0 && data.MaxBytes+encOverheadBytes <= writeLimit {
+		writeLimit = data.MaxBytes + encOverheadBytes
+		capIsMax = true
+	}
+	dlCtx, dlCancel := context.WithCancel(ctx)
+	defer dlCancel()
+	capped := &cappedFile{File: f, limit: writeLimit, onCap: dlCancel}
+
 	downloadStart := time.Now()
-	if err := deps.download(ctx, node.msg, f); err != nil {
+	if err := deps.download(dlCtx, node.msg, capped); err != nil {
+		if capped.exceeded {
+			if capIsMax {
+				deps.log.LogWarn("downloadmedia-to-url: real size over maxBytes %d (declared %d)", data.MaxBytes, node.fileLength)
+				return nil, newMediaToUrlError(http.StatusRequestEntityTooLarge, "too_large",
+					fmt.Sprintf("download crossed maxBytes %d (declared %d)", data.MaxBytes, node.fileLength),
+					map[string]any{"declaredBytes": node.fileLength, "maxBytes": data.MaxBytes})
+			}
+			deps.log.LogWarn("downloadmedia-to-url: download crossed the disk headroom %d (declared %d)", writeLimit, node.fileLength)
+			return nil, newMediaToUrlError(http.StatusServiceUnavailable, "disk_low",
+				fmt.Sprintf("download crossed the free disk headroom (%d bytes)", writeLimit), nil)
+		}
 		mapped := classifyDownloadError(err)
 		deps.log.LogWarn("downloadmedia-to-url: download failed (%s) kind=%s declared=%d: %v", mapped.Code, node.kind, node.fileLength, err)
 		return nil, mapped
@@ -426,7 +511,7 @@ func (m *messageService) DownloadMediaToUrl(data *DownloadMediaToUrlStruct, inst
 		timeout = m.config.MediaToUrlTimeout
 	}
 	deps := mediaToUrlDeps{
-		download: func(ctx context.Context, msg whatsmeow.DownloadableMessage, f *os.File) error {
+		download: func(ctx context.Context, msg whatsmeow.DownloadableMessage, f whatsmeow.File) error {
 			return client.DownloadToFile(ctx, msg, f)
 		},
 		httpClient: storageHTTPClient,

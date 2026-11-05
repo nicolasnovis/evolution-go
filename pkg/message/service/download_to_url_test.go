@@ -106,14 +106,14 @@ func docProto(size uint64) *waE2E.Message {
 
 // writeN is a download double that writes `n` bytes of a deterministic pattern into the file.
 func writeN(n int64) downloadToFileFunc {
-	return func(_ context.Context, _ whatsmeow.DownloadableMessage, f *os.File) error {
+	return func(_ context.Context, _ whatsmeow.DownloadableMessage, f whatsmeow.File) error {
 		_, err := io.CopyN(f, &patternReader{}, n)
 		return err
 	}
 }
 
 func failWith(err error) downloadToFileFunc {
-	return func(context.Context, whatsmeow.DownloadableMessage, *os.File) error { return err }
+	return func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { return err }
 }
 
 type patternReader struct{ i byte }
@@ -261,7 +261,7 @@ func TestDownloadMediaToUrl_ContentTypeFallbacks(t *testing.T) {
 
 	// no mimetype anywhere: sniffed from the bytes (a real PDF header)
 	msg := &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{DirectPath: proto.String("/x")}}
-	pdf := func(_ context.Context, _ whatsmeow.DownloadableMessage, f *os.File) error {
+	pdf := func(_ context.Context, _ whatsmeow.DownloadableMessage, f whatsmeow.File) error {
 		_, err := f.Write([]byte("%PDF-1.4\n%âãÏÓ\n1 0 obj\n<<>>\nendobj\n"))
 		return err
 	}
@@ -287,7 +287,7 @@ func TestDownloadMediaToUrl_TooLargeDeclared_NoDownload(t *testing.T) {
 	fs := newFakeStorage(t)
 	dir := setupGuard(t, fs, 0)
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, *os.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
 
 	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(101), UploadUrl: fs.uploadURL(), MaxBytes: 100}, deps(fs, dl))
 	typed := asTyped(t, err)
@@ -310,7 +310,7 @@ func TestDownloadMediaToUrl_ActualSizeOverMax(t *testing.T) {
 	// fileLength lies (says 10), the CDN sends 500
 	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(10), UploadUrl: fs.uploadURL(), MaxBytes: 100}, deps(fs, writeN(500)))
 	typed := asTyped(t, err)
-	if typed.Status != 413 || typed.Code != "too_large" || typed.Extra["actualBytes"] != int64(500) {
+	if typed.Status != 413 || typed.Code != "too_large" {
 		t.Fatalf("413 too_large pelo tamanho real: %+v", typed)
 	}
 	if fs.calls != 0 {
@@ -319,11 +319,95 @@ func TestDownloadMediaToUrl_ActualSizeOverMax(t *testing.T) {
 	assertDirEmpty(t, dir)
 }
 
+// A sender-controlled fileLength that lies must not let the download write past maxBytes: the cap
+// stops io.Copy (whatsmeow fills the file with io.Copy, which prefers ReadFrom) and cancels the
+// download so no other CDN host is tried.
+func TestDownloadMediaToUrl_LyingSizeIsCappedWhileWriting(t *testing.T) {
+	fs := newFakeStorage(t)
+	dir := setupGuard(t, fs, 0)
+	var written int64
+	var ctxDone bool
+	dl := func(ctx context.Context, _ whatsmeow.DownloadableMessage, f whatsmeow.File) error {
+		n, err := io.Copy(f, io.LimitReader(&patternReader{}, 10<<20)) // the "CDN" sends 10 MB
+		written = n
+		ctxDone = ctx.Err() != nil
+		return err
+	}
+	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(10), UploadUrl: fs.uploadURL(), MaxBytes: 1000}, deps(fs, dl))
+	typed := asTyped(t, err)
+	if typed.Status != 413 || typed.Code != "too_large" {
+		t.Fatalf("esperava 413 too_large: %+v", typed)
+	}
+	if written > 1000+encOverheadBytes {
+		t.Fatalf("escreveu %d bytes, acima do teto %d", written, 1000+encOverheadBytes)
+	}
+	if !ctxDone {
+		t.Fatal("o teto devia cancelar o download (sem tentar outro host do CDN)")
+	}
+	if fs.calls != 0 || mediaguard.DiskReserved() != 0 {
+		t.Fatalf("PUT=%d reservado=%d", fs.calls, mediaguard.DiskReserved())
+	}
+	assertDirEmpty(t, dir)
+}
+
+// Without maxBytes the cap is the free-disk headroom (disk_low), never unbounded.
+func TestDownloadMediaToUrl_NoMaxBytesCappedByDiskHeadroom(t *testing.T) {
+	fs := newFakeStorage(t)
+	dir := setupGuard(t, fs, 0)
+	mediaguard.SetDiskProbe(func(string) (uint64, error) { return 1500, nil })
+	_ = mediaguard.InitStreaming(mediaguard.Settings{TmpDir: dir, MinFreeBytes: 1000, AllowedHosts: []string{fs.host(t)}})
+	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(10), UploadUrl: fs.uploadURL()}, deps(fs, writeN(5000)))
+	typed := asTyped(t, err)
+	if typed.Status != 503 || typed.Code != "disk_low" {
+		t.Fatalf("esperava 503 disk_low pelo teto de disco: %+v", typed)
+	}
+	if mediaguard.DiskReserved() != 0 {
+		t.Fatalf("reserva não foi solta: %d", mediaguard.DiskReserved())
+	}
+	assertDirEmpty(t, dir)
+}
+
+// The PUT never follows a redirect: a 307 would replay the body to a host outside the allow-list.
+func TestDownloadMediaToUrl_PutDoesNotFollowRedirect(t *testing.T) {
+	var evilHits atomic.Int32
+	evil := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		evilHits.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+	}))
+	t.Cleanup(evil.Close)
+	redir := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		http.Redirect(w, r, evil.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redir.Close)
+	u, _ := url.Parse(redir.URL)
+	dir := t.TempDir()
+	mediaguard.Init(0, 0)
+	if err := mediaguard.InitStreaming(mediaguard.Settings{TmpDir: dir, AllowedHosts: []string{u.Host}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mediaguard.InitStreaming(mediaguard.Settings{TmpDir: os.TempDir()}) })
+
+	client := redir.Client()
+	client.CheckRedirect = storageHTTPClient.CheckRedirect
+	client.Transport.(*http.Transport).TLSClientConfig.InsecureSkipVerify = true // evil uses another cert
+	d := mediaToUrlDeps{download: writeN(10), httpClient: client, timeout: 10 * time.Second, acquireWait: 50 * time.Millisecond}
+	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(10), UploadUrl: redir.URL + "/up"}, d)
+	typed := asTyped(t, err)
+	if typed.Status != 502 || typed.Code != "storage_rejected" || typed.Extra["status"] != 307 {
+		t.Fatalf("redirect devia virar storage_rejected 307: %+v", typed)
+	}
+	if evilHits.Load() != 0 {
+		t.Fatal("o PUT seguiu o redirect pra um host fora da lista")
+	}
+	assertDirEmpty(t, dir)
+}
+
 func TestDownloadMediaToUrl_SSRF(t *testing.T) {
 	fs := newFakeStorage(t)
 	setupGuard(t, fs, 0)
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, *os.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
 
 	for _, bad := range []string{
 		"http://" + fs.host(t) + "/plain",
@@ -407,7 +491,7 @@ func TestDownloadMediaToUrl_ErrorMapping(t *testing.T) {
 func TestDownloadMediaToUrl_DeadlineDuringDownload(t *testing.T) {
 	fs := newFakeStorage(t)
 	dir := setupGuard(t, fs, 0)
-	slow := func(ctx context.Context, _ whatsmeow.DownloadableMessage, _ *os.File) error {
+	slow := func(ctx context.Context, _ whatsmeow.DownloadableMessage, _ whatsmeow.File) error {
 		<-ctx.Done()
 		return ctx.Err()
 	}
@@ -471,7 +555,7 @@ func TestDownloadMediaToUrl_Busy(t *testing.T) {
 		t.Fatal(err)
 	}
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, *os.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
 
 	start := time.Now()
 	_, err = downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(1), UploadUrl: fs.uploadURL()}, deps(fs, dl))
@@ -503,7 +587,7 @@ func TestDownloadMediaToUrl_DiskLow(t *testing.T) {
 	_ = seenNeed
 
 	var downloads atomic.Int32
-	dl := func(context.Context, whatsmeow.DownloadableMessage, *os.File) error { downloads.Add(1); return nil }
+	dl := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { downloads.Add(1); return nil }
 	// declared 200 + reserve 900 > 1000 free → disk_low, nothing downloaded
 	_, err := downloadMediaToUrl(context.Background(), &DownloadMediaToUrlStruct{Message: docProto(200), UploadUrl: fs.uploadURL()}, deps(fs, dl))
 	typed := asTyped(t, err)
@@ -584,7 +668,7 @@ func TestDownloadMediaToUrl_MemoryBounded(t *testing.T) {
 func TestDownloadMediaToUrl_TempRemovedOnPanic(t *testing.T) {
 	fs := newFakeStorage(t)
 	dir := setupGuard(t, fs, 0)
-	boom := func(context.Context, whatsmeow.DownloadableMessage, *os.File) error { panic("boom") }
+	boom := func(context.Context, whatsmeow.DownloadableMessage, whatsmeow.File) error { panic("boom") }
 	func() {
 		defer func() {
 			if recover() == nil {

@@ -51,6 +51,19 @@ const (
 	MEDIA_MAX_AUTODOWNLOAD_BYTES = "MEDIA_MAX_AUTODOWNLOAD_BYTES" // pula o auto-download acima de N bytes (0 = sem teto)
 	MEDIA_DOWNLOAD_CONCURRENCY   = "MEDIA_DOWNLOAD_CONCURRENCY"   // máx. downloads simultâneos no processo (0 = ilimitado)
 
+	// Mídia pesada em STREAMING (ver pkg/mediaguard, pkg/message/service/download_to_url.go e
+	// pkg/sendMessage/service/media_source.go). Tudo nasce INERTE/compatível: sem as envs, os endpoints
+	// atuais se comportam como hoje e o endpoint novo responde 503 not_configured.
+	MEDIA_AUTODOWNLOAD           = "MEDIA_AUTODOWNLOAD"           // "off" desliga o auto-download de recebimento (MinIO que ninguém lê); vazio = como hoje
+	MEDIA_TMP_DIR                = "MEDIA_TMP_DIR"                // pasta EM DISCO (nunca tmpfs) dos temporários rx-*/tx-*; default /app/tmp-media
+	MEDIA_TMP_MIN_FREE_BYTES     = "MEDIA_TMP_MIN_FREE_BYTES"     // reserva de disco exigida além do arquivo; default 3 GiB
+	MEDIA_UPLOAD_ALLOWED_HOSTS   = "MEDIA_UPLOAD_ALLOWED_HOSTS"   // hosts (vírgula) aceitos nas URLs do Storage (anti-SSRF); vazio = downloadmedia-to-url desligado
+	MEDIA_TO_URL_TIMEOUT         = "MEDIA_TO_URL_TIMEOUT"         // prazo total do downloadmedia-to-url ("240s", "4m" ou segundos); default 240s
+	SEND_MEDIA_MAX_BYTES         = "SEND_MEDIA_MAX_BYTES"         // teto do arquivo no /send/media por URL; default 104857600 (100 MB)
+	SEND_MEDIA_STREAM_ABOVE      = "SEND_MEDIA_STREAM_ABOVE"      // documento/vídeo acima de N bytes vai em streaming (disco); 0/vazio = desligado (tudo como hoje)
+	SEND_MEDIA_TIMEOUT           = "SEND_MEDIA_TIMEOUT"           // prazo total do /send/media por URL ("280s" ou segundos); default 280s
+	MEDIA_SEND_LARGE_CONCURRENCY = "MEDIA_SEND_LARGE_CONCURRENCY" // envios grandes (streaming) simultâneos; default 1
+
 	// Outbox durável de webhook (ver pkg/events/webhook/outbox_*). Nasce INERTE: vazio/false = comportamento
 	// antigo (fire-and-retry em memória). "true" liga a fila write-ahead no Postgres + worker de drain.
 	WEBHOOK_OUTBOX_ENABLED = "WEBHOOK_OUTBOX_ENABLED"

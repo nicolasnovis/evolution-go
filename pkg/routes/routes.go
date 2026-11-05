@@ -155,6 +155,7 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 			routes.POST("/pollvote", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.VotePoll)
 			routes.POST("/markplayed", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.MarkPlayed)
 			routes.POST("/downloadmedia", r.messageHandler.DownloadMedia)
+			routes.POST("/downloadmedia-to-url", r.messageHandler.DownloadMediaToUrl) // streaming CDN→disco→PUT no Storage, sem base64 (plano arquivos-pesados A.1)
 			routes.POST("/status", r.messageHandler.GetMessageStatus)
 			routes.POST("/delete", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.DeleteMessageEveryone)
 			routes.POST("/edit", r.jidValidationMiddleware.ValidateNumberField(), r.messageHandler.EditMessage) // text or caption (image/video/document) — see EditMessageStruct.Kind
@@ -165,18 +166,18 @@ func (r *Routes) AssignRoutes(eng *gin.Engine) {
 	{
 		routes.Use(r.authMiddleware.Auth)
 		{
-			routes.POST("/pin", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatPin)               // CRM→WA: fixa a conversa
-			routes.POST("/unpin", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnpin)           // CRM→WA: desafixa
-			routes.POST("/archive", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatArchive)       // CRM→WA: arquiva (âncora da última msg vem no body)
-			routes.POST("/unarchive", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnarchive)   // CRM→WA: desarquiva
-			routes.POST("/read", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatRead)             // CRM→WA: tira a marca de "não lida"
-			routes.POST("/unread", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnread)         // CRM→WA: marca como "não lida"
-			routes.POST("/mute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatMute)             // TODO: not working
-			routes.POST("/unmute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnmute)         // TODO: not working
-			routes.POST("/delete-for-me", r.chatHandler.DeleteMessageForMe) // CRM→WA: apagar para mim (some em todos os aparelhos deste número)
-			routes.POST("/recover-appstate", r.chatHandler.RecoverAppState) // destrava regular_low (recovery request)
-			routes.POST("/reset-appstate", r.chatHandler.ResetAppState)     // RESETA regular_low (fatal exception; desloga linkados)
-			routes.POST("/sync-stickers", r.chatHandler.SyncFavoriteStickers) // figurinhas favoritas do celular → webhook FavoriteSticker
+			routes.POST("/pin", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatPin)             // CRM→WA: fixa a conversa
+			routes.POST("/unpin", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnpin)         // CRM→WA: desafixa
+			routes.POST("/archive", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatArchive)     // CRM→WA: arquiva (âncora da última msg vem no body)
+			routes.POST("/unarchive", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnarchive) // CRM→WA: desarquiva
+			routes.POST("/read", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatRead)           // CRM→WA: tira a marca de "não lida"
+			routes.POST("/unread", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnread)       // CRM→WA: marca como "não lida"
+			routes.POST("/mute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatMute)           // TODO: not working
+			routes.POST("/unmute", r.jidValidationMiddleware.ValidateNumberField(), r.chatHandler.ChatUnmute)       // TODO: not working
+			routes.POST("/delete-for-me", r.chatHandler.DeleteMessageForMe)                                         // CRM→WA: apagar para mim (some em todos os aparelhos deste número)
+			routes.POST("/recover-appstate", r.chatHandler.RecoverAppState)                                         // destrava regular_low (recovery request)
+			routes.POST("/reset-appstate", r.chatHandler.ResetAppState)                                             // RESETA regular_low (fatal exception; desloga linkados)
+			routes.POST("/sync-stickers", r.chatHandler.SyncFavoriteStickers)                                       // figurinhas favoritas do celular → webhook FavoriteSticker
 			routes.POST("/history-sync", r.chatHandler.HistorySyncRequest)
 			routes.POST("/request-unavailable", r.chatHandler.RequestUnavailable) // pede ao celular do dono a mensagem que este aparelho não tem
 		}

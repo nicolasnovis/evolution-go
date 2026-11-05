@@ -66,6 +66,17 @@ type Config struct {
 	MediaMaxAutoDownloadBytes int64
 	MediaDownloadConcurrency  int
 
+	// Mídia pesada em streaming (ver config_env.MEDIA_* / SEND_MEDIA_*). Defaults = comportamento de hoje.
+	MediaAutoDownloadOff      bool
+	MediaTmpDir               string
+	MediaTmpMinFreeBytes      int64
+	MediaUploadAllowedHosts   []string
+	MediaToUrlTimeout         time.Duration
+	SendMediaMaxBytes         int64
+	SendMediaStreamAbove      int64 // 0 = streaming desligado
+	SendMediaTimeout          time.Duration
+	MediaSendLargeConcurrency int
+
 	// Outbox durável de webhook (pkg/events/webhook). false = inerte (fire-and-retry em memória, comportamento antigo).
 	WebhookOutboxEnabled bool
 
@@ -326,6 +337,21 @@ func Load() *Config {
 		mediaDownloadConcurrency, _ = strconv.Atoi(v)
 	}
 
+	// Mídia pesada em streaming — defaults reproduzem o comportamento de hoje; a troca da imagem não muda
+	// nada até as envs serem ligadas (ver docs no config_env).
+	mediaAutoDownloadOff := strings.EqualFold(strings.TrimSpace(os.Getenv(config_env.MEDIA_AUTODOWNLOAD)), "off")
+	mediaTmpDir := strings.TrimSpace(os.Getenv(config_env.MEDIA_TMP_DIR))
+	if mediaTmpDir == "" {
+		mediaTmpDir = "/app/tmp-media"
+	}
+	mediaTmpMinFreeBytes := envInt64(config_env.MEDIA_TMP_MIN_FREE_BYTES, 3*1024*1024*1024)
+	mediaUploadAllowedHosts := envList(config_env.MEDIA_UPLOAD_ALLOWED_HOSTS)
+	mediaToUrlTimeout := envDuration(config_env.MEDIA_TO_URL_TIMEOUT, 240*time.Second)
+	sendMediaMaxBytes := envInt64(config_env.SEND_MEDIA_MAX_BYTES, 100*1024*1024)
+	sendMediaStreamAbove := envInt64(config_env.SEND_MEDIA_STREAM_ABOVE, 0)
+	sendMediaTimeout := envDuration(config_env.SEND_MEDIA_TIMEOUT, 280*time.Second)
+	mediaSendLargeConcurrency := int(envInt64(config_env.MEDIA_SEND_LARGE_CONCURRENCY, 1))
+
 	// Outbox de webhook — inerte por padrão; só "true"/"enabled" liga.
 	webhookOutboxEnabled := false
 	if v := os.Getenv(config_env.WEBHOOK_OUTBOX_ENABLED); v == "true" || v == "enabled" || v == "1" {
@@ -433,6 +459,15 @@ func Load() *Config {
 
 		MediaMaxAutoDownloadBytes: mediaMaxAutoDownloadBytes,
 		MediaDownloadConcurrency:  mediaDownloadConcurrency,
+		MediaAutoDownloadOff:      mediaAutoDownloadOff,
+		MediaTmpDir:               mediaTmpDir,
+		MediaTmpMinFreeBytes:      mediaTmpMinFreeBytes,
+		MediaUploadAllowedHosts:   mediaUploadAllowedHosts,
+		MediaToUrlTimeout:         mediaToUrlTimeout,
+		SendMediaMaxBytes:         sendMediaMaxBytes,
+		SendMediaStreamAbove:      sendMediaStreamAbove,
+		SendMediaTimeout:          sendMediaTimeout,
+		MediaSendLargeConcurrency: mediaSendLargeConcurrency,
 		WebhookOutboxEnabled:      webhookOutboxEnabled,
 		WebhookMaxPayloadBytes:    webhookMaxPayloadBytes,
 		PairingPlatform:           pairingPlatform,
@@ -516,4 +551,48 @@ func validateAMQPURL(amqpURL string) error {
 
 	logger.LogInfo("[CONFIG] AMQP URL validation successful: %s://%s", parsedURL.Scheme, parsedURL.Host)
 	return nil
+}
+
+// envInt64 reads an integer env var; empty, unparsable or negative values fall back to def.
+func envInt64(name string, def int64) int64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
+// envDuration reads a duration env var. Accepts Go syntax ("240s", "4m") or a plain number of seconds.
+// Empty, unparsable or non-positive values fall back to def.
+func envDuration(name string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs <= 0 {
+			return def
+		}
+		return time.Duration(secs) * time.Second
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
+
+// envList reads a comma-separated env var into trimmed, lower-cased, non-empty entries.
+func envList(name string) []string {
+	var out []string
+	for _, part := range strings.Split(os.Getenv(name), ",") {
+		if p := strings.ToLower(strings.TrimSpace(part)); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

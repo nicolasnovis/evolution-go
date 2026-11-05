@@ -211,7 +211,7 @@ func setupRouter(db *gorm.DB, authDB *sql.DB, sqliteDB *sql.DB, config *config.C
 	)
 	sendMessageService := send_service.NewSendService(clientPointer, whatsmeowService, config, loggerWrapper)
 	userService := user_service.NewUserService(clientPointer, whatsmeowService, loggerWrapper)
-	messageService := message_service.NewMessageService(clientPointer, messageRepository, whatsmeowService, loggerWrapper)
+	messageService := message_service.NewMessageService(clientPointer, messageRepository, whatsmeowService, loggerWrapper, config)
 	chatService := chat_service.NewChatService(clientPointer, whatsmeowService, loggerWrapper)
 	groupService := group_service.NewGroupService(clientPointer, whatsmeowService, loggerWrapper)
 	callService := call_service.NewCallService(clientPointer, whatsmeowService, loggerWrapper)
@@ -364,6 +364,19 @@ func main() {
 
 	// Freios de memória do download de mídia (pkg/mediaguard) — inertes até serem ligados por env.
 	mediaguard.Init(cfg.MediaDownloadConcurrency, cfg.MediaMaxAutoDownloadBytes)
+	// Mídia pesada em streaming (temporários em disco, guarda de disco, hosts do Storage, auto-download
+	// off) — defaults = comportamento de hoje. Também varre rx-*/tx-* órfãos de um processo morto no meio.
+	if err := mediaguard.InitStreaming(mediaguard.Settings{
+		TmpDir:               cfg.MediaTmpDir,
+		MinFreeBytes:         cfg.MediaTmpMinFreeBytes,
+		AllowedHosts:         cfg.MediaUploadAllowedHosts,
+		SendLargeConcurrency: cfg.MediaSendLargeConcurrency,
+		AutoDownloadOff:      cfg.MediaAutoDownloadOff,
+	}); err != nil {
+		logger.LogWarn("mediaguard: %v", err)
+	}
+	logger.LogInfo("mediaguard: tmp=%s minFree=%d allowedHosts=%v autoDownloadOff=%v sendLargeConcurrency=%d streamAbove=%d sendMax=%d",
+		mediaguard.TmpDir(), cfg.MediaTmpMinFreeBytes, cfg.MediaUploadAllowedHosts, cfg.MediaAutoDownloadOff, cfg.MediaSendLargeConcurrency, cfg.SendMediaStreamAbove, cfg.SendMediaMaxBytes)
 
 	logger.LogInfo("Starting Evolution GO version %s", version)
 

@@ -1,6 +1,7 @@
 package message_handler
 
 import (
+	"errors"
 	"net/http"
 
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
@@ -15,6 +16,7 @@ type MessageHandler interface {
 	MarkRead(ctx *gin.Context)
 	MarkPlayed(ctx *gin.Context)
 	DownloadMedia(ctx *gin.Context)
+	DownloadMediaToUrl(ctx *gin.Context)
 	GetMessageStatus(ctx *gin.Context)
 	DeleteMessageEveryone(ctx *gin.Context)
 	EditMessage(ctx *gin.Context)
@@ -301,6 +303,61 @@ func (m *messageHandler) DownloadMedia(ctx *gin.Context) {
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": responseData})
+}
+
+// DownloadMediaToUrl streams a media message to a signed upload URL (no base64, no RAM copy)
+// @Summary Download media straight to a Storage upload URL
+// @Description Decrypts the media to a temp file on disk and PUTs it to uploadUrl (https, host in MEDIA_UPLOAD_ALLOWED_HOSTS). Errors carry a stable "code": too_large (413), expired (410), corrupt (422), busy/disk_low/not_configured/disconnected (503), timeout (504), storage_rejected/download_failed (502), upload_url_not_allowed/invalid_media (400).
+// @Tags Message
+// @Accept json
+// @Produce json
+// @Param message body message_service.DownloadMediaToUrlStruct true "Media proto + signed upload URL"
+// @Success 200 {object} gin.H "success"
+// @Failure 400 {object} gin.H "Error on validation"
+// @Failure 410 {object} gin.H "Media expired on WhatsApp"
+// @Failure 413 {object} gin.H "Media above maxBytes"
+// @Failure 422 {object} gin.H "Media corrupt"
+// @Failure 503 {object} gin.H "Busy / disk low / not configured"
+// @Router /message/downloadmedia-to-url [post]
+func (m *messageHandler) DownloadMediaToUrl(ctx *gin.Context) {
+	getInstance := ctx.MustGet("instance")
+
+	instance, ok := getInstance.(*instance_model.Instance)
+	if !ok {
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": "instance not found", "code": "internal"})
+		return
+	}
+
+	var data *message_service.DownloadMediaToUrlStruct
+	if err := ctx.ShouldBindBodyWithJSON(&data); err != nil || data == nil {
+		detail := "invalid body"
+		if err != nil {
+			detail = err.Error()
+		}
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": detail, "code": "bad_request"})
+		return
+	}
+	if data.Message == nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "message is required", "code": "bad_request"})
+		return
+	}
+	if data.UploadUrl == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "uploadUrl is required", "code": "bad_request"})
+		return
+	}
+
+	result, err := m.messageService.DownloadMediaToUrl(data, instance, ctx.Request)
+	if err != nil {
+		var typed *message_service.MediaToUrlError
+		if errors.As(err, &typed) {
+			ctx.JSON(typed.Status, typed.Fields())
+			return
+		}
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "code": "internal"})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "success", "data": result})
 }
 
 // GetMessageStatus get message status

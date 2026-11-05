@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	config "github.com/evolution-foundation/evolution-go/pkg/config"
 	instance_model "github.com/evolution-foundation/evolution-go/pkg/instance/model"
 	logger_wrapper "github.com/evolution-foundation/evolution-go/pkg/logger"
 	"github.com/evolution-foundation/evolution-go/pkg/mediaguard"
@@ -31,6 +32,7 @@ type MessageService interface {
 	MarkRead(data *MarkReadStruct, instance *instance_model.Instance) (string, error)
 	MarkPlayed(data *MarkPlayedStruct, instance *instance_model.Instance) (string, error)
 	DownloadMedia(data *DownloadMediaStruct, instance *instance_model.Instance, request *http.Request) (*dataurl.DataURL, string, error)
+	DownloadMediaToUrl(data *DownloadMediaToUrlStruct, instance *instance_model.Instance, request *http.Request) (*DownloadMediaToUrlResult, error)
 	GetMessageStatus(data *MessageStatusStruct, instance *instance_model.Instance) (*message_model.Message, string, error)
 	DeleteMessageEveryone(data *MessageStruct, instance *instance_model.Instance) (string, string, error)
 	EditMessage(data *EditMessageStruct, instance *instance_model.Instance) (string, string, error)
@@ -43,6 +45,7 @@ type messageService struct {
 	messageRepository message_repository.MessageRepository
 	whatsmeowService  whatsmeow_service.WhatsmeowService
 	loggerWrapper     *logger_wrapper.LoggerManager
+	config            *config.Config // nil-safe: only the streaming endpoint reads it
 }
 
 type ReactStruct struct {
@@ -662,11 +665,13 @@ func NewMessageService(
 	messageRepository message_repository.MessageRepository,
 	whatsmeowService whatsmeow_service.WhatsmeowService,
 	loggerWrapper *logger_wrapper.LoggerManager,
+	cfg *config.Config,
 ) MessageService {
 	return &messageService{
 		clientPointer:     clientPointer,
 		messageRepository: messageRepository,
 		whatsmeowService:  whatsmeowService,
 		loggerWrapper:     loggerWrapper,
+		config:            cfg,
 	}
 }

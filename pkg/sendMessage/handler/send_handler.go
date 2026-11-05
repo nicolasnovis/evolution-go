@@ -2,6 +2,7 @@ package send_handler
 
 import (
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -272,8 +273,15 @@ func (s *sendHandler) SendMedia(ctx *gin.Context) {
 				return
 			}
 		} else {
-			message, err = s.sendMessageService.SendMediaUrl(data, instance)
+			message, err = s.sendMessageService.SendMediaUrl(ctx.Request.Context(), data, instance)
 			if err != nil {
+				// Typed failures (too_large, busy, disk_low, download_failed, upload_failed, timeout,
+				// url_not_allowed) carry their own status + code; everything else stays a 500 as before.
+				var typed *send_service.SendMediaError
+				if errors.As(err, &typed) {
+					ctx.JSON(typed.Status, typed.Fields())
+					return
+				}
 				ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}

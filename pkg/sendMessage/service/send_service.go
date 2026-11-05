@@ -38,7 +38,7 @@ import (
 type SendService interface {
 	SendText(data *TextStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendLink(data *LinkStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
-	SendMediaUrl(data *MediaStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
+	SendMediaUrl(ctx context.Context, data *MediaStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendMediaFile(data *MediaStruct, fileData []byte, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendPoll(data *PollStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
 	SendSticker(data *StickerStruct, instance *instance_model.Instance) (*MessageSendStruct, error)
@@ -99,23 +99,23 @@ type TextStruct struct {
 }
 
 type LinkStruct struct {
-	Number       string       `json:"number"`
-	Text         string       `json:"text"`
-	Title        string       `json:"title"`
-	Url          string       `json:"url"`
-	Description  string       `json:"description"`
-	ImgUrl       string       `json:"imgUrl"`
+	Number      string `json:"number"`
+	Text        string `json:"text"`
+	Title       string `json:"title"`
+	Url         string `json:"url"`
+	Description string `json:"description"`
+	ImgUrl      string `json:"imgUrl"`
 	// Prévia já pronta (o Novi busca, recorta e comprime): JPEG pequeno em base64 + tamanho.
 	// Com Title preenchido o motor NÃO busca nada sozinho.
-	JpegThumbnail   string `json:"jpegThumbnail"`
-	ThumbnailWidth  uint32 `json:"thumbnailWidth"`
-	ThumbnailHeight uint32 `json:"thumbnailHeight"`
-	Id           string       `json:"id"`
-	Delay        int32        `json:"delay"`
-	MentionedJID []string     `json:"mentionedJid"`
-	MentionAll   bool         `json:"mentionAll"`
-	FormatJid    *bool        `json:"formatJid,omitempty"`
-	Quoted       QuotedStruct `json:"quoted"`
+	JpegThumbnail   string       `json:"jpegThumbnail"`
+	ThumbnailWidth  uint32       `json:"thumbnailWidth"`
+	ThumbnailHeight uint32       `json:"thumbnailHeight"`
+	Id              string       `json:"id"`
+	Delay           int32        `json:"delay"`
+	MentionedJID    []string     `json:"mentionedJid"`
+	MentionAll      bool         `json:"mentionAll"`
+	FormatJid       *bool        `json:"formatJid,omitempty"`
+	Quoted          QuotedStruct `json:"quoted"`
 }
 
 type MediaStruct struct {
@@ -749,6 +749,7 @@ func (s *sendService) SendLink(data *LinkStruct, instance *instance_model.Instan
 // buildLinkMessage monta o texto COM prévia de link (cartão: miniatura, título, descrição).
 //   - Prévia pronta (Title preenchido, como o Novi manda) → usa ela, sem buscar nada.
 //   - Sem Title → tenta buscar (com timeout); se falhar, vai SEM prévia.
+//
 // Em NENHUM caso a prévia impede o envio: antes, falhar a busca derrubava a mensagem inteira.
 func buildLinkMessage(data *LinkStruct) *waE2E.ExtendedTextMessage {
 	ext := &waE2E.ExtendedTextMessage{Text: &data.Text}
@@ -1208,13 +1209,13 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 			}
 			if isNewsletter {
 				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
-					FileName:      &data.Filename,
-					Caption:       proto.String(data.Caption),
-					URL:           &uploaded.URL,
-					DirectPath:    &uploaded.DirectPath,
-					Mimetype:      proto.String(mimeType),
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    &uploaded.FileLength,
+					FileName:        &data.Filename,
+					Caption:         proto.String(data.Caption),
+					URL:             &uploaded.URL,
+					DirectPath:      &uploaded.DirectPath,
+					Mimetype:        proto.String(mimeType),
+					FileSHA256:      uploaded.FileSHA256,
+					FileLength:      &uploaded.FileLength,
 					JPEGThumbnail:   jpegThumb,
 					ThumbnailWidth:  thumbW,
 					ThumbnailHeight: thumbH,
@@ -1222,15 +1223,15 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 				}}
 			} else {
 				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
-					FileName:      &data.Filename,
-					Caption:       proto.String(data.Caption),
-					URL:           proto.String(uploaded.URL),
-					DirectPath:    proto.String(uploaded.DirectPath),
-					MediaKey:      uploaded.MediaKey,
-					Mimetype:      proto.String(mimeType),
-					FileEncSHA256: uploaded.FileEncSHA256,
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    proto.Uint64(uint64(len(fileData))),
+					FileName:        &data.Filename,
+					Caption:         proto.String(data.Caption),
+					URL:             proto.String(uploaded.URL),
+					DirectPath:      proto.String(uploaded.DirectPath),
+					MediaKey:        uploaded.MediaKey,
+					Mimetype:        proto.String(mimeType),
+					FileEncSHA256:   uploaded.FileEncSHA256,
+					FileSHA256:      uploaded.FileSHA256,
+					FileLength:      proto.Uint64(uint64(len(fileData))),
 					JPEGThumbnail:   jpegThumb,
 					ThumbnailWidth:  thumbW,
 					ThumbnailHeight: thumbH,
@@ -1303,339 +1304,103 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 	return nil, fmt.Errorf("failed to send media file after %d attempts", maxRetries)
 }
 
-func (s *sendService) SendMediaUrl(data *MediaStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
-	return s.sendMediaUrlWithRetry(data, instance, 3)
+func (s *sendService) SendMediaUrl(ctx context.Context, data *MediaStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
+	return s.sendMediaUrlWithRetry(ctx, data, instance, 3)
 }
 
-func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instance_model.Instance, maxRetries int) (*MessageSendStruct, error) {
+// sendMediaUrlWithRetry: session → GET the url ONCE (memory or temp file, see media_source.go) →
+// validate/convert/previews → upload ONCE → build the proto → SendMessage, retried only when the
+// session drops. ctx is the request context bounded by SEND_MEDIA_TIMEOUT: when the app gives up,
+// download and upload stop instead of running to completion for nobody.
+func (s *sendService) sendMediaUrlWithRetry(ctx context.Context, data *MediaStruct, instance *instance_model.Instance, maxRetries int) (*MessageSendStruct, error) {
+	log := s.loggerWrapper.GetLogger(instance.Id)
+	startTime := time.Now()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if s.config != nil && s.config.SendMediaTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.config.SendMediaTimeout)
+		defer cancel()
+	}
+	log.LogInfo("[%s] SendMediaUrl for URL: %s", instance.Id, data.Url)
+
+	// Session first (same budget as before: up to maxRetries rounds of ensureClientConnectedWithRetry).
+	var client *whatsmeow.Client
+	var err error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMediaUrl attempt %d/%d for URL: %s", instance.Id, attempt, maxRetries, data.Url)
-		startTime := time.Now()
-
-		client, err := s.ensureClientConnectedWithRetry(instance.Id, 2)
-		if err != nil {
-			if attempt == maxRetries {
-				return nil, err
-			}
-			continue
+		client, err = s.ensureClientConnectedWithRetry(instance.Id, 2)
+		if err == nil {
+			break
 		}
-
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Iniciando download da URL: %s", instance.Id, data.Url)
-
-		resp, err := http.Get(data.Url)
-		if err != nil {
+		if attempt == maxRetries {
 			return nil, err
 		}
-		defer resp.Body.Close()
-
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Download concluído em %v. Lendo dados...", instance.Id, time.Since(startTime))
-
-		downloadStart := time.Now()
-		fileData, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Leitura dos dados concluída em %v. Tamanho: %d bytes", instance.Id, time.Since(downloadStart), len(fileData))
-
-		mime, _ := mimetype.DetectReader(bytes.NewReader(fileData))
-		mimeType := mime.String()
-		if strings.HasSuffix(strings.ToLower(data.Url), ".mp4") {
-			mimeType = "video/mp4"
-		}
-
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Tipo MIME detectado: %s", instance.Id, mimeType)
-
-		var uploadType whatsmeow.MediaType
-		var duration int
-
-		processingStart := time.Now()
-		switch data.Type {
-		case "image":
-			if mimeType != "image/jpeg" && mimeType != "image/png" && mimeType != "image/webp" {
-				errMsg := fmt.Sprintf("Invalid file format: '%s'. Only 'image/jpeg', 'image/png' and 'image/webp' are accepted", mimeType)
-				return nil, errors.New(errMsg)
-			}
-			if mimeType == "image/webp" {
-				mimeType = "image/jpeg"
-			}
-			uploadType = whatsmeow.MediaImage
-
-		case "video", "ptv":
-			if mimeType != "video/mp4" {
-				errMsg := fmt.Sprintf("Invalid file format: '%s'. Only 'video/mp4' are accepted", mimeType)
-				return nil, errors.New(errMsg)
-			}
-			uploadType = whatsmeow.MediaVideo
-		case "audio":
-			s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Iniciando conversão de áudio...", instance.Id)
-			converterApiUrl := s.config.ApiAudioConverter
-			converterApiKey := s.config.ApiAudioConverterKey
-			var convertedData []byte
-			var err error
-			if converterApiUrl == "" {
-				s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Usando conversão local...", instance.Id)
-				convertedData, duration, err = convertAudioToOpusWithDuration(fileData)
-			} else {
-				s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Usando API de conversão...", instance.Id)
-				convertedData, duration, err = convertAudioWithApi(converterApiUrl, converterApiKey, ConvertAudio{Base64: base64.StdEncoding.EncodeToString(fileData)})
-			}
-			if err != nil {
-				return nil, err
-			}
-			fileData = convertedData
-			mimeType = "audio/ogg; codecs=opus"
-			uploadType = whatsmeow.MediaAudio
-			s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Conversão de áudio concluída em %v", instance.Id, time.Since(processingStart))
-		case "document":
-			uploadType = whatsmeow.MediaDocument
-		default:
-			return nil, errors.New("invalid media type")
-		}
-
-		// Detectar se é newsletter para usar upload sem criptografia
-		isNewsletter := strings.Contains(data.Number, "@newsletter")
-
-		// Validar se é documento em newsletter (não suportado)
-		if isNewsletter && data.Type == "document" {
-			return nil, errors.New("documentos não são suportados em canais do WhatsApp. Use imagem, vídeo, áudio ou enquete")
-		}
-
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Iniciando upload para WhatsApp (Newsletter: %v)...", instance.Id, isNewsletter)
-		uploadStart := time.Now()
-
-		var uploaded whatsmeow.UploadResponse
-		if isNewsletter {
-			// Newsletter: upload sem criptografia
-			uploaded, err = client.UploadNewsletter(context.Background(), fileData, uploadType)
-			s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Newsletter upload - Handle: %s", instance.Id, uploaded.Handle)
-		} else {
-			// Upload normal com criptografia
-			uploaded, err = client.Upload(context.Background(), fileData, uploadType)
-		}
-
-		if err != nil {
-			return nil, err
-		}
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Upload concluído em %v. Tamanho: %d", instance.Id, time.Since(uploadStart), uploaded.FileLength)
-
-		var media *waE2E.Message
-		var mediaType string
-
-		switch data.Type {
-		case "image":
-			// Generate a JPEG preview thumbnail for better client UX (iOS in
-			// particular). On failure jpegThumb is nil and the message is sent
-			// without a preview rather than failing the request.
-			jpegThumb := makeJPEGThumbnail(fileData, 72)
-			if isNewsletter {
-				// Newsletter: sem criptografia (sem MediaKey e FileEncSHA256)
-				media = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-					Caption:       proto.String(data.Caption),
-					URL:           &uploaded.URL,
-					DirectPath:    &uploaded.DirectPath,
-					Mimetype:      proto.String(mimeType),
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    &uploaded.FileLength,
-					JPEGThumbnail: jpegThumb,
-				}}
-			} else {
-				// Normal: com criptografia
-				media = &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
-					Caption:       proto.String(data.Caption),
-					URL:           proto.String(uploaded.URL),
-					DirectPath:    proto.String(uploaded.DirectPath),
-					MediaKey:      uploaded.MediaKey,
-					Mimetype:      proto.String(mimeType),
-					FileEncSHA256: uploaded.FileEncSHA256,
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    proto.Uint64(uint64(len(fileData))),
-					JPEGThumbnail: jpegThumb,
-				}}
-			}
-			mediaType = "ImageMessage"
-		case "video":
-			if isNewsletter {
-				media = &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
-					Caption:    proto.String(data.Caption),
-					URL:        &uploaded.URL,
-					DirectPath: &uploaded.DirectPath,
-					Mimetype:   proto.String(mimeType),
-					FileSHA256: uploaded.FileSHA256,
-					FileLength: &uploaded.FileLength,
-				}}
-			} else {
-				media = &waE2E.Message{VideoMessage: &waE2E.VideoMessage{
-					Caption:       proto.String(data.Caption),
-					URL:           proto.String(uploaded.URL),
-					DirectPath:    proto.String(uploaded.DirectPath),
-					MediaKey:      uploaded.MediaKey,
-					Mimetype:      proto.String(mimeType),
-					FileEncSHA256: uploaded.FileEncSHA256,
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    proto.Uint64(uint64(len(fileData))),
-				}}
-			}
-			mediaType = "VideoMessage"
-		case "ptv":
-			if isNewsletter {
-				media = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
-					URL:        &uploaded.URL,
-					DirectPath: &uploaded.DirectPath,
-					Mimetype:   proto.String(mimeType),
-					FileSHA256: uploaded.FileSHA256,
-					FileLength: &uploaded.FileLength,
-				}}
-			} else {
-				media = &waE2E.Message{PtvMessage: &waE2E.VideoMessage{
-					URL:           proto.String(uploaded.URL),
-					DirectPath:    proto.String(uploaded.DirectPath),
-					MediaKey:      uploaded.MediaKey,
-					Mimetype:      proto.String(mimeType),
-					FileEncSHA256: uploaded.FileEncSHA256,
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    proto.Uint64(uint64(len(fileData))),
-				}}
-			}
-			mediaType = "PtvMessage"
-		case "audio":
-			if isNewsletter {
-				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
-					URL:              &uploaded.URL,
-					PTT:              proto.Bool(true),
-					DirectPath:       &uploaded.DirectPath,
-					Mimetype:         proto.String(mimeType),
-					FileSHA256:       uploaded.FileSHA256,
-					FileLength:       &uploaded.FileLength,
-					StreamingSidecar: []byte(*proto.String("QpmXDsU7YLagdg==")),
-					Waveform:         []byte(*proto.String("OjAnExISDgsKCAkJBwgkHAQEBBEFAwMNAxAcKCgkFzM0QUE4Jh4eKAoKChcLCwkeFgkJCQo3JiQmIiIRPz8/Ow==")),
-					Seconds:          proto.Uint32(uint32(duration)),
-				}}
-			} else {
-				media = &waE2E.Message{AudioMessage: &waE2E.AudioMessage{
-					URL:              proto.String(uploaded.URL),
-					PTT:              proto.Bool(true),
-					DirectPath:       proto.String(uploaded.DirectPath),
-					MediaKey:         uploaded.MediaKey,
-					Mimetype:         proto.String(mimeType),
-					FileEncSHA256:    uploaded.FileEncSHA256,
-					FileSHA256:       uploaded.FileSHA256,
-					FileLength:       proto.Uint64(uploaded.FileLength),
-					StreamingSidecar: []byte(*proto.String("QpmXDsU7YLagdg==")),
-					Waveform:         []byte(*proto.String("OjAnExISDgsKCAkJBwgkHAQEBBEFAwMNAxAcKCgkFzM0QUE4Jh4eKAoKChcLCwkeFgkJCQo3JiQmIiIRPz8/Ow==")),
-					Seconds:          proto.Uint32(uint32(duration)),
-				}}
-			}
-			mediaType = "AudioMessage"
-		case "document":
-			// For PDF documents, rasterize page 1 into a JPEG preview thumbnail.
-			// A missing pdftoppm or a failure yields nil and the document is
-			// sent without a preview instead of failing the request.
-			var jpegThumb []byte
-			var thumbW, thumbH, pageCount *uint32
-			if mimeType == "application/pdf" {
-				jpegThumb, thumbW, thumbH = makePDFThumbnail(fileData, pdfThumbWidth)
-				pageCount = pdfPageCount(fileData)
-			}
-			if isNewsletter {
-				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
-					URL:           &uploaded.URL,
-					FileName:      &data.Filename,
-					Caption:       proto.String(data.Caption),
-					DirectPath:    &uploaded.DirectPath,
-					Mimetype:      proto.String(mimeType),
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    &uploaded.FileLength,
-					JPEGThumbnail:   jpegThumb,
-					ThumbnailWidth:  thumbW,
-					ThumbnailHeight: thumbH,
-					PageCount:       pageCount,
-				}}
-			} else {
-				media = &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
-					URL:           proto.String(uploaded.URL),
-					FileName:      &data.Filename,
-					Caption:       proto.String(data.Caption),
-					DirectPath:    proto.String(uploaded.DirectPath),
-					MediaKey:      uploaded.MediaKey,
-					Mimetype:      proto.String(mimeType),
-					FileEncSHA256: uploaded.FileEncSHA256,
-					FileSHA256:    uploaded.FileSHA256,
-					FileLength:    proto.Uint64(uint64(len(fileData))),
-					JPEGThumbnail:   jpegThumb,
-					ThumbnailWidth:  thumbW,
-					ThumbnailHeight: thumbH,
-					PageCount:       pageCount,
-				}}
-			}
-
-			if media.GetDocumentMessage().GetCaption() != "" {
-				media.DocumentWithCaptionMessage = &waE2E.FutureProofMessage{
-					Message: &waE2E.Message{
-						DocumentMessage: media.DocumentMessage,
-					},
-				}
-				media.DocumentMessage = nil
-			}
-
-			mediaType = "DocumentMessage"
-		default:
-			return nil, errors.New("invalid media type")
-		}
-
-		// view-once: when requested, flag the media so it disappears after the recipient opens it
-		// once (image, video and voice/PTV support it; documents do not). Additive — without the
-		// flag the media is a normal message, exactly as before.
-		if data.ViewOnce {
-			if media.ImageMessage != nil {
-				media.ImageMessage.ViewOnce = proto.Bool(true)
-			}
-			if media.VideoMessage != nil {
-				media.VideoMessage.ViewOnce = proto.Bool(true)
-			}
-			if media.AudioMessage != nil {
-				media.AudioMessage.ViewOnce = proto.Bool(true)
-			}
-			if media.PtvMessage != nil {
-				media.PtvMessage.ViewOnce = proto.Bool(true)
-			}
-		}
-
-		messageStart := time.Now()
-		message, err := s.SendMessage(instance, media, mediaType, &SendDataStruct{
-			Id:              data.Id,
-			Number:          data.Number,
-			Quoted:          data.Quoted,
-			Delay:           data.Delay,
-			MentionAll:      data.MentionAll,
-			MentionedJID:    data.MentionedJID,
-			FormatJid:       data.FormatJid,
-			MediaHandle:     uploaded.Handle,
-			ForwardingScore: data.ForwardingScore,
-		})
-
-		if err != nil {
-			// Check if it's a client disconnection error
-			if strings.Contains(err.Error(), "client disconnected") || strings.Contains(err.Error(), "no active session") {
-				s.loggerWrapper.GetLogger(instance.Id).LogWarn("[%s] SendMediaUrl failed due to disconnection on attempt %d/%d: %v", instance.Id, attempt, maxRetries, err)
-				if attempt < maxRetries {
-					waitTime := time.Duration(attempt) * time.Second
-					s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Waiting %v before retry", instance.Id, waitTime)
-					time.Sleep(waitTime)
-					continue
-				}
-			}
-			return nil, err
-		}
-
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] Mensagem enviada em %v", instance.Id, time.Since(messageStart))
-
-		totalTime := time.Since(startTime)
-		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMediaUrl successful on attempt %d, processo completo em %v", instance.Id, attempt, totalTime)
-
-		return message, nil
 	}
 
-	return nil, fmt.Errorf("failed to send media url after %d attempts", maxRetries)
+	// Detectar se é newsletter para usar upload sem criptografia
+	isNewsletter := strings.Contains(data.Number, "@newsletter")
+
+	// Validar se é documento em newsletter (não suportado)
+	if isNewsletter && data.Type == "document" {
+		return nil, errors.New("documentos não são suportados em canais do WhatsApp. Use imagem, vídeo, áudio ou enquete")
+	}
+
+	log.LogInfo("[%s] Iniciando download da URL: %s", instance.Id, data.Url)
+	downloadStart := time.Now()
+	src, err := fetchMediaSource(ctx, data.Url, data.Type, isNewsletter, s.sendMediaLimits(), log)
+	if err != nil {
+		return nil, err
+	}
+	defer src.Close()
+	log.LogInfo("[%s] Download concluído em %v. Tamanho: %d bytes, streaming: %v", instance.Id, time.Since(downloadStart), src.size, src.streamed())
+
+	prep, err := s.prepareMedia(src, data, instance)
+	if err != nil {
+		return nil, err
+	}
+
+	log.LogInfo("[%s] Iniciando upload para WhatsApp (Newsletter: %v, streaming: %v)...", instance.Id, isNewsletter, src.streamed())
+	uploadStart := time.Now()
+	uploaded, err := uploadMediaSource(ctx, client, src, prep.uploadType, isNewsletter)
+	if err != nil {
+		return nil, err
+	}
+	if isNewsletter {
+		log.LogInfo("[%s] Newsletter upload - Handle: %s", instance.Id, uploaded.Handle)
+	}
+	log.LogInfo("[%s] Upload concluído em %v. Tamanho: %d", instance.Id, time.Since(uploadStart), uploaded.FileLength)
+
+	media, mediaType, err := buildMediaMessage(data, prep, uploaded, isNewsletter)
+	if err != nil {
+		return nil, err
+	}
+
+	sendData := &SendDataStruct{
+		Id:              data.Id,
+		Number:          data.Number,
+		Quoted:          data.Quoted,
+		Delay:           data.Delay,
+		MentionAll:      data.MentionAll,
+		MentionedJID:    data.MentionedJID,
+		FormatJid:       data.FormatJid,
+		MediaHandle:     uploaded.Handle,
+		ForwardingScore: data.ForwardingScore,
+	}
+	message, err := sendWithRetryOnDisconnect(maxRetries,
+		func() error {
+			_, err := s.ensureClientConnectedWithRetry(instance.Id, 2)
+			return err
+		},
+		func() (*MessageSendStruct, error) {
+			return s.SendMessage(instance, media, mediaType, sendData)
+		},
+		time.Sleep, log)
+	if err != nil {
+		return nil, err
+	}
+	log.LogInfo("[%s] SendMediaUrl successful, processo completo em %v", instance.Id, time.Since(startTime))
+	return message, nil
 }
 
 func (s *sendService) SendPoll(data *PollStruct, instance *instance_model.Instance) (*MessageSendStruct, error) {
@@ -2588,7 +2353,6 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 		}
 	}
 
-
 	if data.Quoted.MessageID != "" {
 		switch messageType {
 		case "ExtendedTextMessage":
@@ -2797,8 +2561,8 @@ func (s *sendService) SendMessage(instance *instance_model.Instance, msg *waE2E.
 	}
 
 	messageSent := &MessageSendStruct{
-		Info:    messageInfo,
-		Message: msg,
+		Info:               messageInfo,
+		Message:            msg,
 		MessageContextInfo: data.Quoted.ContextInfo(recipient),
 	}
 
@@ -3437,4 +3201,3 @@ func contextInfoParaMencao(msg *waE2E.Message, messageType string) *waE2E.Contex
 	}
 	return nil
 }
-

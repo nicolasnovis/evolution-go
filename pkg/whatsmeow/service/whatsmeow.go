@@ -1739,7 +1739,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				// GLOBAL segura o pico de RAM de vários downloads simultâneos. Inertes por default.
 				declaredSize := mediaDeclaredSize(img, audio, document, video, sticker, associatedImg, associatedAudio, associatedDocument, associatedVideo, associatedSticker)
 				skipDownload := mediaguard.SkipAutoDownload(declaredSize)
-				if skipDownload {
+				if skipDownload && mediaguard.AutoDownloadOff() {
+					// MEDIA_AUTODOWNLOAD=off: nothing is fetched on receive (the MinIO copy was never read);
+					// the webhook keeps the proto metadata + inline thumbnail and the app materializes
+					// through /message/downloadmedia-to-url.
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] Auto-download desligado (MEDIA_AUTODOWNLOAD=off), %d bytes declarados - ID: %s", mycli.userID, declaredSize, evt.Info.ID)
+				} else if skipDownload {
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] Auto-download PULADO (midia %d bytes acima do teto) - ID: %s", mycli.userID, declaredSize, evt.Info.ID)
 				} else if release, aerr := mediaguard.Acquire(downloadCtx); aerr != nil {
 					skipDownload = true

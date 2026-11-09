@@ -15,12 +15,12 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exslices"
-	"go.mau.fi/util/ptr"
 
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waServerSync"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -45,11 +45,9 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
-	return cli.fetchAppStateLocked(ctx, name, fullSync, onlyIfNotSynced)
-}
-
-// fetchAppStateLocked is the body of fetchAppState. The caller must hold appStateSyncLock.
-func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
+	if until := cli.appStateBackoff[name]; time.Now().Before(until) {
+		return nil, fmt.Errorf("%w: not fetching %s until %s", ErrAppStateRateLimited, name, until.Format(time.RFC3339))
+	}
 	if fullSync {
 		err := cli.Store.AppState.DeleteAppStateVersion(ctx, string(name))
 		if err != nil {
@@ -77,7 +75,16 @@ func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatc
 	}
 	for hasMore {
 		patches, err := cli.fetchAppStatePatches(ctx, name, state.Version, wantSnapshot)
+		var iqErr *IQError
+		if errors.As(err, &iqErr) && iqErr.Code == 429 && iqErr.ErrorNode != nil {
+			if backoff := iqErr.ErrorNode.AttrGetter().OptionalInt("backoff"); backoff > 0 {
+				cli.appStateBackoff[name] = time.Now().Add(time.Duration(backoff) * time.Second)
+			}
+		}
 		if err != nil {
+			if fullSync && ctx.Err() == nil && cli.BackgroundEventCtx.Err() == nil {
+				cli.dispatchEvent(&events.AppStateSyncError{Name: name, FullSync: fullSync, Error: err})
+			}
 			return nil, fmt.Errorf("failed to fetch app state %s patches: %w", name, err)
 		} else if !wantSnapshot && patches.Snapshot != nil {
 			return nil, fmt.Errorf("server unexpectedly returned snapshot for %s without asking", name)
@@ -123,34 +130,23 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
 	version := snapshot.GetVersion().GetVersion()
-	// Hold appStateSyncLock while reading and rewriting the app state store, so the recovery
-	// can't interleave with an incoming sync or an outgoing patch. Event dispatch below stays
-	// outside the lock.
-	storeUpdated := func() bool {
-		cli.appStateSyncLock.Lock()
-		defer cli.appStateSyncLock.Unlock()
-		currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
-		if err != nil {
-			cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
-			return false
-		} else if currentVersion >= version {
-			cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
-			return false
-		}
-		cli.Log.Debugf("Handling app state recovery response for %s", reqID)
-		mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
-		if err != nil {
-			cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
-			return false
-		}
-		err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
-		if err != nil {
-			cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
-			return false
-		}
+	currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
+	if err != nil {
+		cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
 		return true
-	}()
-	if !storeUpdated {
+	} else if currentVersion >= version {
+		cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
+		return true
+	}
+	cli.Log.Debugf("Handling app state recovery response for %s", reqID)
+	mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
+	if err != nil {
+		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
+		return true
+	}
+	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
+	if err != nil {
+		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
 		return true
 	}
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
@@ -202,23 +198,6 @@ func (cli *Client) collectEventsToDispatch(
 		}
 	}
 	for _, mutation := range mutations {
-		// N1 PATCH: favorite stickers always surface — on a full sync too — so a full sync of the
-		// collection is how a client pulls the current favorites list (see events.FavoriteSticker).
-		if len(mutation.Index) > 0 && mutation.Index[0] == appstate.IndexFavoriteSticker {
-			evt := &events.FavoriteSticker{FromFullSync: fullSync, Removed: mutation.Operation == waServerSync.SyncdMutation_REMOVE}
-			if len(mutation.Index) > 1 {
-				evt.Hash = mutation.Index[1]
-			}
-			if !evt.Removed {
-				evt.Action = mutation.Action.GetStickerAction()
-				evt.Timestamp = time.UnixMilli(mutation.Action.GetTimestamp())
-			}
-			if eventsToDispatch != nil {
-				*eventsToDispatch = append(*eventsToDispatch, evt)
-			} else {
-				cli.dispatchEvent(evt)
-			}
-		}
 		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
 			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
 		}
@@ -281,7 +260,8 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		return
 	}
 
-	if mutation.Operation != waServerSync.SyncdMutation_SET {
+	isContactRemove := mutation.Operation == waServerSync.SyncdMutation_REMOVE && mutation.Index[0] == appstate.IndexContact
+	if mutation.Operation != waServerSync.SyncdMutation_SET && !isContactRemove {
 		return
 	}
 
@@ -321,6 +301,9 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 		}
 	case appstate.IndexContact:
 		act := mutation.Action.GetContactAction()
+		if isContactRemove {
+			act = nil
+		}
 		eventToDispatch = &events.Contact{JID: jid, Timestamp: ts, Action: act, FromFullSync: fullSync}
 		if cli.Store.Contacts != nil {
 			storeUpdateError = cli.Store.Contacts.PutContactName(ctx, jid, act.GetFirstName(), act.GetFullName())
@@ -450,6 +433,38 @@ func (cli *Client) dispatchAppState(ctx context.Context, name appstate.WAPatchNa
 			Action:       act,
 			FromFullSync: fullSync,
 		}
+	case appstate.IndexWasaRootSecretAction:
+		if len(mutation.Index) < 2 {
+			return
+		}
+		botJID, _ := types.ParseJID(mutation.Index[1])
+		ownLID := cli.getOwnLID()
+		inputSecrets := mutation.Action.GetWasaRootSecretAction().GetSecrets()
+		ids := make([]string, 0, len(inputSecrets))
+		storeUpdateError = cli.Store.MsgSecrets.PutMessageSecrets(ctx, exslices.CastFunc(inputSecrets, func(secret *waSyncAction.WASARootSecretAction_RootSecretEntry) store.MessageSecretInsert {
+			ids = append(ids, secret.GetID())
+			return store.MessageSecretInsert{
+				Chat:   botJID,
+				Sender: ownLID,
+				ID:     secret.GetID(),
+				Secret: secret.GetRootSecret(),
+			}
+		}))
+		if storeUpdateError == nil && cli.Store.ChatSettings != nil {
+			var active *waSyncAction.WASARootSecretAction_RootSecretEntry
+			for _, secret := range inputSecrets {
+				if secret.GetStatus() == waSyncAction.WASARootSecretAction_RootSecretEntry_ACTIVE && (active == nil || secret.GetEpoch() > active.GetEpoch()) {
+					active = secret
+				}
+			}
+			storeUpdateError = cli.Store.ChatSettings.PutWASARootSecretID(ctx, botJID, types.MessageID(active.GetID()))
+		}
+		if storeUpdateError == nil {
+			zerolog.Ctx(ctx).Debug().
+				Strs("ids", ids).
+				Stringer("bot_jid", botJID).
+				Msg("Stored WASA root secrets from app state")
+		}
 	}
 	if storeUpdateError != nil {
 		cli.Log.Errorf("Failed to update device store after app state mutation: %v", storeUpdateError)
@@ -543,19 +558,10 @@ func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) e
 	return cli.sendAppState(ctx, patch, true)
 }
 
-// sendAppState holds appStateSyncLock for the whole send, including the 409 conflict retry and
-// the post-send resync, so an outgoing patch can never interleave with an incoming sync.
 func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	if cli == nil {
 		return ErrClientIsNil
 	}
-	cli.appStateSyncLock.Lock()
-	defer cli.appStateSyncLock.Unlock()
-	return cli.sendAppStateLocked(ctx, patch, allowRetry)
-}
-
-// sendAppStateLocked is the body of sendAppState. The caller must hold appStateSyncLock.
-func (cli *Client) sendAppStateLocked(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
 	if err != nil {
 		return err
@@ -626,12 +632,12 @@ func (cli *Client) sendAppStateLocked(ctx context.Context, patch appstate.PatchI
 						cli.dispatchEvent(evt)
 					}
 				}()
-				return cli.sendAppStateLocked(ctx, patch, false)
+				return cli.sendAppState(ctx, patch, false)
 			}
 		}
 		return mainErr
 	}
-	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
+	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}
@@ -671,7 +677,7 @@ func BuildFatalAppStateExceptionNotification(collections ...appstate.WAPatchName
 			Type: waE2E.ProtocolMessage_APP_STATE_FATAL_EXCEPTION_NOTIFICATION.Enum(),
 			AppStateFatalExceptionNotification: &waE2E.AppStateFatalExceptionNotification{
 				CollectionNames: exslices.CastToString[string](collections),
-				Timestamp:       ptr.Ptr(time.Now().UnixMilli()),
+				Timestamp:       new(time.Now().UnixMilli()),
 			},
 		},
 	}
@@ -690,7 +696,7 @@ func BuildAppStateRecoveryRequest(collection appstate.WAPatchName) *waE2E.Messag
 				PeerDataOperationRequestType: waE2E.PeerDataOperationRequestType_COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY.Enum(),
 				SyncdCollectionFatalRecoveryRequest: &waE2E.PeerDataOperationRequestMessage_SyncDCollectionFatalRecoveryRequest{
 					CollectionName: (*string)(&collection),
-					Timestamp:      ptr.Ptr(time.Now().Unix()),
+					Timestamp:      new(time.Now().Unix()),
 				},
 			},
 		},

@@ -19,7 +19,7 @@ type Contact struct {
 	JID       types.JID // The contact who was modified.
 	Timestamp time.Time // The time when the modification happened.'
 
-	Action       *waSyncAction.ContactAction // The new contact info.
+	Action       *waSyncAction.ContactAction // The new contact info, or nil if the contact was removed.
 	FromFullSync bool                        // Whether the action is emitted because of a fullSync
 }
 
@@ -71,19 +71,6 @@ type DeleteForMe struct {
 
 	Action       *waSyncAction.DeleteMessageForMeAction // Additional information for the deletion.
 	FromFullSync bool                                   // Whether the action is emitted because of a fullSync
-}
-
-// FavoriteSticker is emitted when a sticker is favorited or unfavorited on another device.
-//
-// N1 PATCH: unlike the other app state events it is ALSO emitted during a full sync (even with
-// EmitAppStateEventsOnFullSync off), so a full sync of the collection replays every current favorite.
-type FavoriteSticker struct {
-	Hash      string    // The sticker's index key in the favoriteSticker collection.
-	Timestamp time.Time // The time when the modification happened.
-	Removed   bool      // True when the mutation was a REMOVE (Action is nil then).
-
-	Action       *waSyncAction.StickerAction // The sticker (media keys + isFavorite). Nil when Removed.
-	FromFullSync bool                        // Whether the action is emitted because of a fullSync
 }
 
 // Mute is emitted when a chat is muted or unmuted from another device.

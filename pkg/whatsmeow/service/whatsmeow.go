@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/image/webp"
@@ -135,6 +136,9 @@ type MyClient struct {
 	loggerWrapper      *logger_wrapper.LoggerManager
 	qrcodeCount        int
 	passkeyCeremony    *ceremony.Store
+	// reconnectingUndecryptable: single-flight guard for the async reconnect triggered by
+	// undecryptable messages with ID 66/67 (see the UndecryptableMessage case).
+	reconnectingUndecryptable atomic.Bool
 }
 
 func (mycli *MyClient) persistMessageAsync(message message_model.Message) {
@@ -2483,11 +2487,24 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 			postMap["data"] = evt
 		} else if strings.HasPrefix(evt.Info.ID, "66") || strings.HasPrefix(evt.Info.ID, "67") {
-			mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] ID 66 or 67 found, reconnecting client", mycli.userID)
-			mycli.WAClient.Disconnect()
-			err := mycli.WAClient.Connect()
-			if err != nil {
-				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error reconnecting client: %s", mycli.userID, err)
+			// Reconnect OFF the event goroutine: since whatsmeow 79dc2a8 (upstream cf05480) the retry
+			// receipt and the ack for an undecryptable message are only sent AFTER this handler returns.
+			// Reconnecting inline would send them on the new socket (or never), the server would redeliver
+			// the message and we'd loop. Inline Disconnect also waited on the very event queue we run on.
+			// Single-flight: a burst of 66/67 messages triggers one reconnect, not N concurrent ones.
+			if mycli.reconnectingUndecryptable.CompareAndSwap(false, true) {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] ID 66 or 67 found, reconnecting client", mycli.userID)
+				go func() {
+					defer mycli.reconnectingUndecryptable.Store(false)
+					// let the retry receipt + ack (queued right after this handler returns) leave first
+					time.Sleep(2 * time.Second)
+					mycli.WAClient.Disconnect()
+					if err := mycli.WAClient.Connect(); err != nil {
+						mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] Error reconnecting client: %s", mycli.userID, err)
+					}
+				}()
+			} else {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] ID 66 or 67 found, reconnect already in progress", mycli.userID)
 			}
 		} else {
 			mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] ID is not 66 or 67 or view_once, skipping", mycli.userID)

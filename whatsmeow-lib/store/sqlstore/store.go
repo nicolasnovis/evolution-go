@@ -1085,6 +1085,13 @@ func (s *SQLStore) DoDecryptionTxn(ctx context.Context, fn func(context.Context)
 	return s.db.DoTxn(ctx, nil, fn)
 }
 
+// DoAppStateTxn runs fn inside a single database transaction. The appstate package uses it to
+// write the app state version and mutation MACs atomically.
+func (s *SQLStore) DoAppStateTxn(ctx context.Context, fn func(context.Context) error) error {
+	ctx = context.WithValue(ctx, dbutil.ContextKeyDoTxnCallerSkip, 2)
+	return s.db.DoTxn(ctx, nil, fn)
+}
+
 func (s *SQLStore) ClearBufferedEventPlaintext(ctx context.Context, ciphertextHash [32]byte) error {
 	_, err := s.db.Exec(ctx, clearBufferedEventPlaintextQuery, s.JID, ciphertextHash[:])
 	return err

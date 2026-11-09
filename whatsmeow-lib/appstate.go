@@ -45,6 +45,12 @@ func (cli *Client) fetchAppState(ctx context.Context, name appstate.WAPatchName,
 	}
 	cli.appStateSyncLock.Lock()
 	defer cli.appStateSyncLock.Unlock()
+	return cli.fetchAppStateLocked(ctx, name, fullSync, onlyIfNotSynced)
+}
+
+// fetchAppStateLocked is the body of fetchAppState. The caller must hold appStateSyncLock
+// (which also guards appStateBackoff).
+func (cli *Client) fetchAppStateLocked(ctx context.Context, name appstate.WAPatchName, fullSync, onlyIfNotSynced bool) ([]any, error) {
 	if until := cli.appStateBackoff[name]; time.Now().Before(until) {
 		return nil, fmt.Errorf("%w: not fetching %s until %s", ErrAppStateRateLimited, name, until.Format(time.RFC3339))
 	}
@@ -130,23 +136,34 @@ func (cli *Client) handleAppStateRecovery(
 	}
 	name := appstate.WAPatchName(snapshot.GetCollectionName())
 	version := snapshot.GetVersion().GetVersion()
-	currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
-	if err != nil {
-		cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
+	// Hold appStateSyncLock while reading and rewriting the app state store, so the recovery
+	// can't interleave with an incoming sync or an outgoing patch. Event dispatch below stays
+	// outside the lock.
+	storeUpdated := func() bool {
+		cli.appStateSyncLock.Lock()
+		defer cli.appStateSyncLock.Unlock()
+		currentVersion, _, err := cli.Store.AppState.GetAppStateVersion(ctx, string(name))
+		if err != nil {
+			cli.Log.Errorf("Failed to get current app state %s version for %s: %v", name, reqID, err)
+			return false
+		} else if currentVersion >= version {
+			cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
+			return false
+		}
+		cli.Log.Debugf("Handling app state recovery response for %s", reqID)
+		mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
+		if err != nil {
+			cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
+			return false
+		}
+		err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
+		if err != nil {
+			cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
+			return false
+		}
 		return true
-	} else if currentVersion >= version {
-		cli.Log.Infof("Ignoring app state recovery response for %s as current version %d is newer than or equal to recovery version %d", reqID, currentVersion, snapshot.GetVersion().GetVersion())
-		return true
-	}
-	cli.Log.Debugf("Handling app state recovery response for %s", reqID)
-	mutations, err := cli.appStateProc.ProcessRecovery(ctx, snapshot)
-	if err != nil {
-		cli.Log.Warnf("Failed to parse app state recovery blob for %s: %v", reqID, err)
-		return true
-	}
-	err = cli.collectEventsToDispatch(ctx, name, mutations, true, eventsToDispatchPtr)
-	if err != nil {
-		cli.Log.Warnf("Failed to collect app state events for %s: %v", reqID, err)
+	}()
+	if !storeUpdated {
 		return true
 	}
 	eventsToDispatch = append(eventsToDispatch, &events.AppStateSyncComplete{Name: name, Version: version, Recovery: true})
@@ -198,6 +215,23 @@ func (cli *Client) collectEventsToDispatch(
 		}
 	}
 	for _, mutation := range mutations {
+		// N1 PATCH: favorite stickers always surface — on a full sync too — so a full sync of the
+		// collection is how a client pulls the current favorites list (see events.FavoriteSticker).
+		if len(mutation.Index) > 0 && mutation.Index[0] == appstate.IndexFavoriteSticker {
+			evt := &events.FavoriteSticker{FromFullSync: fullSync, Removed: mutation.Operation == waServerSync.SyncdMutation_REMOVE}
+			if len(mutation.Index) > 1 {
+				evt.Hash = mutation.Index[1]
+			}
+			if !evt.Removed {
+				evt.Action = mutation.Action.GetStickerAction()
+				evt.Timestamp = time.UnixMilli(mutation.Action.GetTimestamp())
+			}
+			if eventsToDispatch != nil {
+				*eventsToDispatch = append(*eventsToDispatch, evt)
+			} else {
+				cli.dispatchEvent(evt)
+			}
+		}
 		if eventsToDispatch != nil && mutation.Operation == waServerSync.SyncdMutation_SET {
 			*eventsToDispatch = append(*eventsToDispatch, &events.AppState{Index: mutation.Index, SyncActionValue: mutation.Action})
 		}
@@ -558,10 +592,19 @@ func (cli *Client) SendAppState(ctx context.Context, patch appstate.PatchInfo) e
 	return cli.sendAppState(ctx, patch, true)
 }
 
+// sendAppState holds appStateSyncLock for the whole send, including the 409 conflict retry and
+// the post-send resync, so an outgoing patch can never interleave with an incoming sync.
 func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	if cli == nil {
 		return ErrClientIsNil
 	}
+	cli.appStateSyncLock.Lock()
+	defer cli.appStateSyncLock.Unlock()
+	return cli.sendAppStateLocked(ctx, patch, allowRetry)
+}
+
+// sendAppStateLocked is the body of sendAppState. The caller must hold appStateSyncLock.
+func (cli *Client) sendAppStateLocked(ctx context.Context, patch appstate.PatchInfo, allowRetry bool) error {
 	version, hash, err := cli.Store.AppState.GetAppStateVersion(ctx, string(patch.Type))
 	if err != nil {
 		return err
@@ -632,12 +675,12 @@ func (cli *Client) sendAppState(ctx context.Context, patch appstate.PatchInfo, a
 						cli.dispatchEvent(evt)
 					}
 				}()
-				return cli.sendAppState(ctx, patch, false)
+				return cli.sendAppStateLocked(ctx, patch, false)
 			}
 		}
 		return mainErr
 	}
-	eventsToDispatch, err := cli.fetchAppState(ctx, patch.Type, false, false)
+	eventsToDispatch, err := cli.fetchAppStateLocked(ctx, patch.Type, false, false)
 	if err != nil {
 		return fmt.Errorf("failed to fetch app state after sending update: %w", err)
 	}

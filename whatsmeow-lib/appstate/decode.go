@@ -227,7 +227,32 @@ func (proc *Processor) decodeMutations(
 	return nil
 }
 
+// appStateTxnStore is implemented by app state stores that can run several writes atomically
+// (see sqlstore.SQLStore.DoAppStateTxn). Stores that don't implement it fall back to plain
+// sequential writes.
+type appStateTxnStore interface {
+	DoAppStateTxn(ctx context.Context, fn func(context.Context) error) error
+}
+
+// doAppStateTxn runs fn inside a single store transaction when the app state store supports it,
+// and directly otherwise.
+func (proc *Processor) doAppStateTxn(ctx context.Context, fn func(context.Context) error) error {
+	if txnStore, ok := proc.Store.AppState.(appStateTxnStore); ok {
+		return txnStore.DoAppStateTxn(ctx, fn)
+	}
+	return fn(ctx)
+}
+
 func (proc *Processor) storeMACs(ctx context.Context, name WAPatchName, currentState HashState, out *patchOutput) error {
+	// The version and the MACs must land together: if the version is advanced but the MACs
+	// aren't (or vice versa), every later patch is built on a state the server doesn't have and
+	// fails with a mismatching LTHash.
+	return proc.doAppStateTxn(ctx, func(ctx context.Context) error {
+		return proc.storeMACsInTxn(ctx, name, currentState, out)
+	})
+}
+
+func (proc *Processor) storeMACsInTxn(ctx context.Context, name WAPatchName, currentState HashState, out *patchOutput) error {
 	err := proc.Store.AppState.PutAppStateVersion(ctx, string(name), currentState.Version, currentState.Hash)
 	if err != nil {
 		return fmt.Errorf("failed to update app state version in the database: %w", err)

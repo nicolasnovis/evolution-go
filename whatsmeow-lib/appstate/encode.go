@@ -260,6 +260,36 @@ func BuildStar(target, sender types.JID, messageID types.MessageID, fromMe, star
 	}
 }
 
+// BuildDeleteForMe builds an app state patch that deletes a message only for this account ("delete for
+// me"), so it also disappears on the user's other devices. Same index layout as star/the incoming
+// deleteMessageForMe mutation: [deleteMessageForMe, chat, messageID, fromMe "1"/"0", sender or "0"].
+// Version and collection mirror WhatsApp Web / Baileys (apiVersion 3, regular_high); messageTimestamp is
+// the original message's unix time in seconds.
+func BuildDeleteForMe(target, sender types.JID, messageID types.MessageID, fromMe, deleteMedia bool, messageTimestamp time.Time) PatchInfo {
+	isFromMe := "0"
+	if fromMe {
+		isFromMe = "1"
+	}
+	targetJID, senderJID := target.String(), sender.String()
+	if fromMe || sender.IsEmpty() || target.User == sender.User {
+		senderJID = "0"
+	}
+	ts := messageTimestamp.Unix()
+	return PatchInfo{
+		Type: WAPatchRegularHigh,
+		Mutations: []MutationInfo{{
+			Index:   []string{IndexDeleteMessageForMe, targetJID, messageID, isFromMe, senderJID},
+			Version: 3,
+			Value: &waSyncAction.SyncActionValue{
+				DeleteMessageForMeAction: &waSyncAction.DeleteMessageForMeAction{
+					DeleteMedia:      &deleteMedia,
+					MessageTimestamp: &ts,
+				},
+			},
+		}},
+	}
+}
+
 func (proc *Processor) EncodePatch(ctx context.Context, keyID []byte, state HashState, patchInfo PatchInfo) ([]byte, error) {
 	keys, err := proc.getAppStateKey(ctx, keyID)
 	if err != nil {

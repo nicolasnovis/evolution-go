@@ -389,3 +389,29 @@ func TestVideoPreviewFromBytes_ReleasesDiskReservation(t *testing.T) {
 		t.Fatalf("%d slot(s) leaked", len(videoPreviewSlots))
 	}
 }
+
+func TestVideoPreview_CoverIsTheOpeningShot(t *testing.T) {
+	needFFmpeg(t)
+	// 1 s red, then 2 s blue: the thumbnail must be the opening (red) shot, as the owner asked
+	out := filepath.Join(t.TempDir(), "abertura.mp4")
+	cmd := exec.Command("ffmpeg", "-v", "error",
+		"-f", "lavfi", "-i", "color=c=red:s=320x240:d=1:r=25",
+		"-f", "lavfi", "-i", "color=c=blue:s=320x240:d=2:r=25",
+		"-filter_complex", "[0:v][1:v]concat=n=2:v=1[v]", "-map", "[v]", "-pix_fmt", "yuv420p", out)
+	if b, err := cmd.CombinedOutput(); err != nil {
+		t.Skipf("ffmpeg cannot render the test video here: %v %s", err, b)
+	}
+	p := videoPreviewFromFile(out)
+	if p.thumb == nil {
+		t.Fatal("expected a thumbnail")
+	}
+	img, err := jpeg.Decode(bytes.NewReader(p.thumb))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := img.Bounds()
+	r, _, bl, _ := img.At(b.Dx()/2, b.Dy()/2).RGBA()
+	if r <= bl {
+		t.Fatalf("thumbnail is not the opening shot: centre pixel r=%d b=%d (want red)", r>>8, bl>>8)
+	}
+}

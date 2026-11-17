@@ -33,9 +33,10 @@ const (
 	videoThumbMaxBytes = 100 * 1024
 	// videoPreviewTimeout bounds ffprobe + ffmpeg together (the send has its own deadline).
 	videoPreviewTimeout = 20 * time.Second
-	// videoFrameAt: 1 s in skips the black first frame of a fade-in; videos shorter than twice that
-	// use the first frame.
-	videoFrameAt = 1.0
+	// videoFrameAt: the cover is the opening shot, like the app shows it (asked by the owner on
+	// 17/11/2026: videos often open on a title card). 0.1 s instead of 0 because some encoders put a
+	// blank or half-decoded picture at t=0; videos shorter than twice that use the very first frame.
+	videoFrameAt = 0.1
 	// videoInputFormat pins ffmpeg/ffprobe to the ISO-BMFF (mp4) demuxer instead of letting them guess
 	// from the content. Only video/mp4 reaches here, but a URL ending in .mp4 is taken as video/mp4
 	// whatever it holds (sniffedMime), and a guessed demuxer can open URLs by itself: a DASH manifest

@@ -2,16 +2,22 @@ package send_service
 
 import (
 	"bytes"
+	"context"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/evolution-foundation/evolution-go/pkg/mediaguard"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"google.golang.org/protobuf/proto"
 )
@@ -235,5 +241,108 @@ func TestVideoPreview_NotAVideoGivesNothing(t *testing.T) {
 	}
 	if p := videoPreviewFromBytes(nil); p.thumb != nil {
 		t.Fatal("expected an empty preview for no bytes")
+	}
+}
+
+func TestVideoPreview_OnlyTheMP4DemuxerIsUsed(t *testing.T) {
+	// a URL ending in .mp4 passes as video/mp4 whatever it holds: a real video in another container
+	// must not be opened by a guessed demuxer (the same guess that opens URLs, see below)
+	needFFmpeg(t)
+	mkv := filepath.Join(t.TempDir(), "v.mkv")
+	args := []string{"-v", "error", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=25",
+		"-pix_fmt", "yuv420p", "-c:v", "libx264", mkv}
+	if b, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
+		t.Skipf("ffmpeg cannot render the test video here: %v %s", err, b)
+	}
+	if p := videoPreviewFromFile(mkv); p.thumb != nil || p.width != nil || p.seconds != nil {
+		t.Fatalf("a Matroska file got a preview (thumb %d bytes), so the input format is being guessed", len(p.thumb))
+	}
+}
+
+func TestVideoPreview_ManifestCannotMakeFFmpegFetchURLs(t *testing.T) {
+	// a DASH manifest saved as "x.mp4": with a guessed demuxer ffmpeg GETs the address inside it
+	// (SSRF from the VPS). Skipped where ffmpeg has no DASH demuxer (it needs libxml2; the image has it).
+	needFFmpeg(t)
+	if out, err := exec.Command("ffmpeg", "-hide_banner", "-demuxers").Output(); err != nil || !strings.Contains(string(out), " dash ") {
+		t.Skip("this ffmpeg has no DASH demuxer")
+	}
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	mpd := `<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static" mediaPresentationDuration="PT3S" minBufferTime="PT1S" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011">
+<BaseURL>` + srv.URL + `/</BaseURL>
+<Period><AdaptationSet mimeType="video/mp4"><Representation id="1" bandwidth="1000" width="320" height="240"><BaseURL>seg.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>
+`
+	p := videoPreviewFromBytes([]byte(mpd))
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("ffmpeg fetched %d URL(s) named inside the file", n)
+	}
+	if p.thumb != nil || p.width != nil || p.seconds != nil {
+		t.Fatalf("expected an empty preview, got thumb %d bytes, width %v, seconds %v", len(p.thumb), p.width, p.seconds)
+	}
+}
+
+// prepare → upload → build, on both paths: the preview reaches the VideoMessage/PtvMessage, the
+// uploaded bytes are the untouched video, and no temp file is left behind.
+func TestPrepareAndBuild_VideoCarriesPreview(t *testing.T) {
+	needFFmpeg(t)
+	video, err := os.ReadFile(makeTestVideo(t, "640x360", "3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		typ      string
+		streamed bool
+	}{
+		{"video in memory", "video", false},
+		{"video streamed", "video", true},
+		{"ptv in memory", "ptv", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := guardDir(t)
+			s := testService(t)
+			src := &mediaSource{data: video, size: int64(len(video)), mimeType: "video/mp4"}
+			if tc.streamed {
+				f, err := mediaguard.CreateTemp(mediaguard.TempPrefixSend)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.Write(video); err != nil {
+					t.Fatal(err)
+				}
+				src = &mediaSource{file: f, size: int64(len(video)), mimeType: "video/mp4"}
+			}
+			data := &MediaStruct{Number: "5500000000000", Type: tc.typ}
+			prep, err := s.prepareMedia(src, data, ptr(instanceFor("inst")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			up := &fakeUploader{}
+			uploaded, err := uploadMediaSource(context.Background(), up, src, prep.uploadType, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if up.sha256 != shaOf(video) {
+				t.Fatal("the upload did not get the original video bytes")
+			}
+			msg, _, err := buildMediaMessage(data, prep, uploaded, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := msg.GetVideoMessage()
+			if tc.typ == "ptv" {
+				v = msg.GetPtvMessage()
+			}
+			if v == nil || len(v.GetJPEGThumbnail()) == 0 || v.GetWidth() != 640 || v.GetHeight() != 360 || v.GetSeconds() != 3 {
+				t.Fatalf("preview missing: thumb %d bytes, %dx%d, %ds", len(v.GetJPEGThumbnail()), v.GetWidth(), v.GetHeight(), v.GetSeconds())
+			}
+			src.Close()
+			assertDirEmpty(t, dir)
+		})
 	}
 }

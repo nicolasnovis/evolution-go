@@ -36,6 +36,13 @@ const (
 	// videoFrameAt: 1 s in skips the black first frame of a fade-in; videos shorter than twice that
 	// use the first frame.
 	videoFrameAt = 1.0
+	// videoInputFormat pins ffmpeg/ffprobe to the ISO-BMFF (mp4) demuxer instead of letting them guess
+	// from the content. Only video/mp4 reaches here, but a URL ending in .mp4 is taken as video/mp4
+	// whatever it holds (sniffedMime), and a guessed demuxer can open URLs by itself: a DASH manifest
+	// makes ffmpeg GET any address from the VPS (checked on the image's ffmpeg 6.1.1), past
+	// MEDIA_UPLOAD_ALLOWED_HOSTS. The mov demuxer reads only this file (external data references are
+	// off by default); anything that is not an mp4 simply yields no preview.
+	videoInputFormat = "mov"
 )
 
 // videoPreview is what goes into the VideoMessage besides the upload fields. Every field may be nil.
@@ -105,7 +112,7 @@ type videoInfo struct {
 }
 
 func probeVideo(ctx context.Context, path string) (videoInfo, bool) {
-	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-select_streams", "v:0",
+	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-f", videoInputFormat, "-select_streams", "v:0",
 		"-show_entries", "stream=width,height:stream_tags=rotate:stream_side_data=rotation:format=duration",
 		"-of", "json", path)
 	raw, err := cmd.Output()
@@ -196,7 +203,7 @@ func videoFrame(ctx context.Context, path string, duration float64) []byte {
 // keeps one frame per thread in RAM, and a 4K/HEVC phone video on several concurrent sends would
 // press this small VPS (it already went OOM on media once).
 func grabFrame(ctx context.Context, path string, at float64) []byte {
-	args := []string{"-v", "error", "-threads", "1"}
+	args := []string{"-v", "error", "-threads", "1", "-f", videoInputFormat}
 	if at > 0 {
 		args = append(args, "-ss", strconv.FormatFloat(at, 'f', 3, 64))
 	}

@@ -397,6 +397,7 @@ type preparedMedia struct {
 	thumbW     *uint32
 	thumbH     *uint32
 	pageCount  *uint32
+	video      videoPreview // video/ptv: size and duration (the frame goes in jpegThumb)
 }
 
 // prepareMedia validates the detected type against the requested one and builds previews. Runs BEFORE
@@ -426,6 +427,19 @@ func (s *sendService) prepareMedia(src *mediaSource, data *MediaStruct, instance
 			return nil, errors.New(errMsg)
 		}
 		prep.uploadType = whatsmeow.MediaVideo
+		// Frame + size + duration so the recipient sees the video, not a black box (video_preview.go).
+		// The large path reads the plaintext temp file, which is why this runs before the upload.
+		if src.streamed() {
+			prep.video = videoPreviewFromFile(src.file.Name())
+		} else {
+			prep.video = videoPreviewFromBytes(src.data)
+		}
+		prep.jpegThumb = prep.video.thumb
+		if prep.jpegThumb == nil {
+			log.LogWarn("[%s] Vídeo sem miniatura: o ffmpeg não gerou o quadro (segue sem prévia)", instance.Id)
+		} else {
+			log.LogInfo("[%s] Miniatura do vídeo gerada (%d bytes)", instance.Id, len(prep.jpegThumb))
+		}
 
 	case "audio":
 		processingStart := time.Now()
@@ -566,6 +580,7 @@ func buildMediaMessage(data *MediaStruct, prep *preparedMedia, uploaded whatsmeo
 				FileLength:    proto.Uint64(uploaded.FileLength),
 			}}
 		}
+		applyVideoPreview(media.VideoMessage, prep.jpegThumb, prep.video)
 		mediaType = "VideoMessage"
 	case "ptv":
 		if isNewsletter {
@@ -587,6 +602,7 @@ func buildMediaMessage(data *MediaStruct, prep *preparedMedia, uploaded whatsmeo
 				FileLength:    proto.Uint64(uploaded.FileLength),
 			}}
 		}
+		applyVideoPreview(media.PtvMessage, prep.jpegThumb, prep.video)
 		mediaType = "PtvMessage"
 	case "audio":
 		if isNewsletter {

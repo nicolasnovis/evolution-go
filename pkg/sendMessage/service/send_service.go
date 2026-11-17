@@ -1007,6 +1007,8 @@ func (s *sendService) SendMediaFile(data *MediaStruct, fileData []byte, instance
 }
 
 func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte, instance *instance_model.Instance, maxRetries int) (*MessageSendStruct, error) {
+	// video preview (video_preview.go): computed once, not again on every reconnect retry
+	var vprev *videoPreview
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		s.loggerWrapper.GetLogger(instance.Id).LogInfo("[%s] SendMediaFile attempt %d/%d", instance.Id, attempt, maxRetries)
 
@@ -1040,6 +1042,10 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 				return nil, errors.New(errMsg)
 			}
 			uploadType = whatsmeow.MediaVideo
+			if vprev == nil {
+				p := videoPreviewFromBytes(fileData)
+				vprev = &p
+			}
 		case "audio":
 			converterApiUrl := s.config.ApiAudioConverter
 			converterApiKey := s.config.ApiAudioConverterKey
@@ -1149,6 +1155,9 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 					FileSHA256:    uploaded.FileSHA256,
 					FileLength:    proto.Uint64(uint64(len(fileData))),
 				}}
+			}
+			if vprev != nil {
+				applyVideoPreview(media.VideoMessage, vprev.thumb, *vprev)
 			}
 			mediaType = "VideoMessage"
 		case "ptv":

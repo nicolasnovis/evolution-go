@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/evolution-foundation/evolution-go/pkg/mediaguard"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -344,5 +345,47 @@ func TestPrepareAndBuild_VideoCarriesPreview(t *testing.T) {
 			src.Close()
 			assertDirEmpty(t, dir)
 		})
+	}
+}
+
+func TestVideoPreview_BusySlotsGoWithoutPreview(t *testing.T) {
+	needFFmpeg(t)
+	path := makeTestVideo(t, "320x240", "2")
+	old := videoPreviewSlotWait
+	videoPreviewSlotWait = 50 * time.Millisecond
+	t.Cleanup(func() { videoPreviewSlotWait = old })
+	// take every slot, as concurrent sends would
+	for i := 0; i < videoPreviewConcurrency; i++ {
+		videoPreviewSlots <- struct{}{}
+	}
+	if p := videoPreviewFromFile(path); p.thumb != nil || p.seconds != nil {
+		t.Fatal("with every slot busy the video must go without a preview")
+	}
+	for i := 0; i < videoPreviewConcurrency; i++ {
+		<-videoPreviewSlots
+	}
+	if p := videoPreviewFromFile(path); p.thumb == nil {
+		t.Fatal("with a free slot the preview must come back")
+	}
+	if len(videoPreviewSlots) != 0 {
+		t.Fatalf("%d slot(s) leaked", len(videoPreviewSlots))
+	}
+}
+
+func TestVideoPreviewFromBytes_ReleasesDiskReservation(t *testing.T) {
+	needFFmpeg(t)
+	data, err := os.ReadFile(makeTestVideo(t, "320x240", "2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := mediaguard.DiskReserved()
+	if p := videoPreviewFromBytes(data); p.thumb == nil {
+		t.Fatal("expected a thumbnail")
+	}
+	if after := mediaguard.DiskReserved(); after != before {
+		t.Fatalf("disk reservation leaked: %d before, %d after", before, after)
+	}
+	if len(videoPreviewSlots) != 0 {
+		t.Fatalf("%d slot(s) leaked", len(videoPreviewSlots))
 	}
 }

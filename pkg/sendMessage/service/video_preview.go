@@ -63,12 +63,48 @@ func applyVideoPreview(m *waE2E.VideoMessage, thumb []byte, p videoPreview) {
 	m.Width, m.Height, m.Seconds = p.width, p.height, p.seconds
 }
 
+const (
+	// videoPreviewConcurrency caps how many previews decode at once. The large path already sends one
+	// file at a time, but the in-memory path does not: a burst of 4K/HEVC videos would each start an
+	// ffmpeg (~150 MB at 1 thread) on top of the bytes the sends already hold.
+	videoPreviewConcurrency = 2
+)
+
+var (
+	videoPreviewSlots = make(chan struct{}, videoPreviewConcurrency)
+	// videoPreviewSlotWait: how long a send waits for a preview slot before going without a preview
+	// (a var so tests can shorten it).
+	videoPreviewSlotWait = 10 * time.Second
+)
+
+// acquirePreviewSlot waits up to videoPreviewSlotWait for a slot; false = go without a preview.
+func acquirePreviewSlot() (release func(), ok bool) {
+	timer := time.NewTimer(videoPreviewSlotWait)
+	defer timer.Stop()
+	select {
+	case videoPreviewSlots <- struct{}{}:
+		return func() { <-videoPreviewSlots }, true
+	case <-timer.C:
+		return func() {}, false
+	}
+}
+
 // videoPreviewFromFile reads the preview of a PLAINTEXT video on disk. On the large path it must run
 // before the upload: UploadReader encrypts the temp file in place.
 func videoPreviewFromFile(path string) videoPreview {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return videoPreview{}
 	}
+	release, ok := acquirePreviewSlot()
+	if !ok {
+		return videoPreview{}
+	}
+	defer release()
+	return previewOfFile(path)
+}
+
+// previewOfFile runs ffprobe + ffmpeg on a plaintext video (the caller holds a preview slot).
+func previewOfFile(path string) videoPreview {
 	ctx, cancel := context.WithTimeout(context.Background(), videoPreviewTimeout)
 	defer cancel()
 
@@ -92,9 +128,19 @@ func videoPreviewFromBytes(data []byte) videoPreview {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		return videoPreview{}
 	}
-	if err := mediaguard.EnsureDiskFor(int64(len(data))); err != nil {
+	// the slot first: a send waiting for one must not hold a disk reservation or a temp copy meanwhile
+	releaseSlot, ok := acquirePreviewSlot()
+	if !ok {
 		return videoPreview{}
 	}
+	defer releaseSlot()
+	// ReserveDisk (not EnsureDiskFor): counts what the other in-flight transfers were promised.
+	// Deferred first, so it is released only after the temp file below is gone.
+	releaseDisk, _, err := mediaguard.ReserveDisk(int64(len(data)))
+	if err != nil {
+		return videoPreview{}
+	}
+	defer releaseDisk()
 	f, err := mediaguard.CreateTemp(mediaguard.TempPrefixSend)
 	if err != nil {
 		return videoPreview{}
@@ -103,7 +149,7 @@ func videoPreviewFromBytes(data []byte) videoPreview {
 	if _, err := f.Write(data); err != nil {
 		return videoPreview{}
 	}
-	return videoPreviewFromFile(f.Name())
+	return previewOfFile(f.Name())
 }
 
 type videoInfo struct {

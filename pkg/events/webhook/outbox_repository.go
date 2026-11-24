@@ -140,18 +140,48 @@ func (r *OutboxRepository) MarkDead(id uint64, status int, errMsg string) error 
 // per instance is ~9h of draining, a claim that sorts the whole backlog on every tick and receipts hours
 // late that only feed a group tick / "N/M viewed" count. The newest are kept because they are the closest
 // to what people see now. The lane is fixed in the SQL on purpose: this can never touch live, sync or bulk.
+//
+// WHY three plain statements and not one `UPDATE … WHERE id IN (SELECT … ROW_NUMBER() …)`: statistics are
+// always taken while pending rows are rare (almost every row is delivered), so in the very flood this cap
+// exists for the planner estimates ~1 pending receipt, joins that IN with a nested loop and re-runs the
+// window for every pending row. Quadratic: with pre-flood statistics, 20k pending receipts took 6m50s on a
+// real Postgres (19, via PGlite) and kept this lane's loop stuck the whole time. Here each statement is a
+// single index scan (idx_outbox_lane_due, then idx_outbox_inst_pending), linear whatever the statistics say:
+// the same 20k took ~0.4s. The loop that delivers this lane is the one calling this, so the rows at or below
+// the cutoff cannot change state in between; rows enqueued meanwhile have a higher id and are kept.
 func (r *OutboxRepository) TrimReceipts(keep int, reason string) (int64, error) {
-	res := r.db.Exec(`
-		UPDATE webhook_outbox SET status = ?, last_error = ?
-		WHERE lane = ? AND status = ? AND id IN (
-			SELECT id FROM (
-				SELECT id, ROW_NUMBER() OVER (PARTITION BY instance_id ORDER BY id DESC) AS posicao
-				FROM webhook_outbox
-				WHERE lane = ? AND status = ?
-			) fila
-			WHERE posicao > ?
-		)`, OutboxDead, truncate(reason, 500), LaneReceipts, OutboxPending, LaneReceipts, OutboxPending, keep)
-	return res.RowsAffected, res.Error
+	var instancias []string
+	if err := r.db.Raw(`
+		SELECT instance_id FROM webhook_outbox
+		WHERE lane = ? AND status = ?
+		GROUP BY instance_id
+		HAVING count(*) > ?`, LaneReceipts, OutboxPending, keep).Scan(&instancias).Error; err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, inst := range instancias {
+		// cutoff = the newest row to drop: skip the instance's `keep` newest pending receipts
+		var corte []uint64
+		if err := r.db.Raw(`
+			SELECT id FROM webhook_outbox
+			WHERE instance_id = ? AND lane = ? AND status = ?
+			ORDER BY id DESC
+			LIMIT 1 OFFSET ?`, inst, LaneReceipts, OutboxPending, keep).Scan(&corte).Error; err != nil {
+			return total, err
+		}
+		if len(corte) == 0 {
+			continue
+		}
+		res := r.db.Exec(`
+			UPDATE webhook_outbox SET status = ?, last_error = ?
+			WHERE instance_id = ? AND lane = ? AND status = ? AND id <= ?`,
+			OutboxDead, truncate(reason, 500), inst, LaneReceipts, OutboxPending, corte[0])
+		if res.Error != nil {
+			return total, res.Error
+		}
+		total += res.RowsAffected
+	}
+	return total, nil
 }
 
 // Cleanup apaga `delivered` antigos e `dead` bem antigos, pra a tabela não crescer sem limite.

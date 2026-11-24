@@ -5,6 +5,7 @@ package webhook_producer
 import (
 	"os"
 	"testing"
+	"time"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -236,5 +237,86 @@ func TestOutboxReceiptsLaneIntegration(t *testing.T) {
 	// under the cap, nothing changes
 	if n, _ := repo.TrimReceipts(10, "teto de teste"); n != 0 {
 		t.Fatalf("abaixo do teto não pode descartar nada, descartou %d", n)
+	}
+}
+
+// The cap must stay linear in the flood it exists for. Statistics are taken while pending rows are rare, so
+// in a flood the planner estimates ~1 pending receipt; the first version (one UPDATE … WHERE id IN (SELECT …
+// ROW_NUMBER() …)) got a nested loop from that and re-ran the window per pending row: 20k pending receipts
+// took 6m50s. Here 9k pending receipts arrive after an ANALYZE that saw none.
+func TestOutboxTrimReceiptsStaleStatsIntegration(t *testing.T) {
+	dsn := os.Getenv("OUTBOX_TEST_DSN")
+	if dsn == "" {
+		t.Skip("OUTBOX_TEST_DSN não definido")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Exec(`drop table if exists webhook_outbox`)
+	if err := db.AutoMigrate(&WebhookOutbox{}); err != nil {
+		t.Fatal(err)
+	}
+	// no autoanalyze in the middle: the statistics must stay the pre-flood ones
+	db.Exec(`alter table webhook_outbox set (autovacuum_enabled = false)`)
+	repo := NewOutboxRepository(db)
+
+	// a normal moment: everything delivered (1 in 10 is a group receipt); statistics are taken now
+	if err := db.Exec(`insert into webhook_outbox (instance_id, event, lane, payload, status, attempts, next_attempt_at, created_at, delivered_at)
+		select 'i' || (g % 20), case when g % 10 = 0 then 'Receipt' else 'Message' end,
+			case when g % 10 = 0 then 'receipts' else 'live' end, '{}', 'delivered', 1, now(), now(), now()
+		from generate_series(1, 20000) g`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`analyze webhook_outbox`).Error; err != nil {
+		t.Fatal(err)
+	}
+	// older than the flood (ids below its cutoff), so the cap must tell them apart by instance and by lane:
+	// a neighbour's receipts under the cap, and the flooded instance's own live message and Contact
+	var intocaveis []uint64
+	for _, e := range []struct{ inst, event, lane string }{
+		{"vizinha", "Receipt", LaneReceipts}, {"vizinha", "Receipt", LaneReceipts},
+		{"inundada", "Message", LaneLive}, {"inundada", "Contact", LaneSync},
+	} {
+		id, err := repo.Enqueue(e.inst, e.event, e.lane, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		intocaveis = append(intocaveis, id)
+	}
+	// then the flood: 9k pending group receipts on one instance
+	if err := db.Exec(`insert into webhook_outbox (instance_id, event, lane, payload, status, attempts, next_attempt_at, created_at)
+		select 'inundada', 'Receipt', 'receipts', '{}', 'pending', 0, now(), now() from generate_series(1, 9000) g`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	inicio := time.Now()
+	n, err := repo.TrimReceipts(5000, "teto de teste")
+	levou := time.Since(inicio)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4000 {
+		t.Fatalf("deveria descartar os 4.000 pendentes mais antigos, descartou %d", n)
+	}
+	// generous bound: linear stays well under a second; the quadratic plan took over a minute here
+	if levou > 5*time.Second {
+		t.Fatalf("teto levou %s com estatísticas de antes da enxurrada: o plano voltou a ser quadrático", levou)
+	}
+	var intactos int64
+	db.Model(&WebhookOutbox{}).Where("status = ? AND id IN ?", OutboxPending, intocaveis).Count(&intactos)
+	if intactos != int64(len(intocaveis)) {
+		t.Fatalf("o teto só pode descartar recibos da instância acima dele (intactos=%d/%d)", intactos, len(intocaveis))
+	}
+	var sobra struct {
+		N        int64
+		Min, Max uint64
+	}
+	db.Raw(`select count(*) as n, min(id) as min, max(id) as max from webhook_outbox
+		where instance_id = 'inundada' and lane = 'receipts' and status = 'pending'`).Scan(&sobra)
+	var maisNovo uint64
+	db.Raw(`select max(id) from webhook_outbox where instance_id = 'inundada'`).Scan(&maisNovo)
+	if sobra.N != 5000 || sobra.Max != maisNovo || sobra.Max-sobra.Min != 4999 {
+		t.Fatalf("deveriam sobrar os 5.000 recibos mais novos, sobrou %+v (mais novo %d)", sobra, maisNovo)
 	}
 }

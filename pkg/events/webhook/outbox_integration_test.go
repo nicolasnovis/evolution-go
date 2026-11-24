@@ -143,3 +143,98 @@ func TestOutboxRodizioIntegration(t *testing.T) {
 		t.Fatalf("faixa sync deveria trazer o Contact, trouxe %d", len(sync))
 	}
 }
+
+// 24/11: ~63k group receipts in the live lane held 2,417 messages for 2h30. In their own lane they never
+// hold a live message, they drain in round-robin like the other lanes, and the cap drops the OLDEST pending
+// ones of an instance above it, without touching delivered rows, other instances or other lanes.
+func TestOutboxReceiptsLaneIntegration(t *testing.T) {
+	dsn := os.Getenv("OUTBOX_TEST_DSN")
+	if dsn == "" {
+		t.Skip("OUTBOX_TEST_DSN não definido")
+	}
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Exec(`drop table if exists webhook_outbox`)
+	if err := db.AutoMigrate(&WebhookOutbox{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := NewOutboxRepository(db)
+
+	// "A" = the flooded instance: 30 group receipts, then a live message
+	var recibos []uint64
+	for i := 0; i < 30; i++ {
+		id, err := repo.Enqueue("A", "Receipt", LaneReceipts, []byte(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		recibos = append(recibos, id)
+	}
+	msg, _ := repo.Enqueue("A", "Message", LaneLive, []byte(`{}`))
+	if older, _ := repo.HasOlderPending("A", msg, LaneLive); older {
+		t.Fatal("recibo de grupo pendente não pode segurar a mensagem ao vivo")
+	}
+	b1, _ := repo.Enqueue("B", "Receipt", LaneReceipts, []byte(`{}`))
+	repo.Enqueue("A", "Contact", LaneSync, []byte(`{}`))
+
+	// receipts are born due (no immediate send) and drain in round-robin, in id order per instance
+	lote, err := repo.ClaimDue(LaneReceipts, 100, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	porInstancia := map[string][]uint64{}
+	for _, r := range lote {
+		porInstancia[r.InstanceID] = append(porInstancia[r.InstanceID], r.ID)
+	}
+	if got := porInstancia["A"]; len(got) != 20 || got[0] != recibos[0] {
+		t.Fatalf("A deveria vir com 20 (cota), a partir do mais antigo, veio %v", got)
+	}
+	if got := porInstancia["B"]; len(got) != 1 || got[0] != b1 {
+		t.Fatalf("B deveria vir no lote, veio %v", got)
+	}
+	// the live lane never sees receipts (and the message is still reserved for the immediate send)
+	if live, _ := repo.ClaimDue(LaneLive, 100, 20); len(live) != 0 {
+		t.Fatalf("a faixa ao vivo não pode ver recibos, viu %d linhas", len(live))
+	}
+
+	// cap: the 5 oldest of A were already delivered (they neither count nor change); of the 25 pending,
+	// the 10 newest stay and the 15 oldest become dead
+	for _, id := range recibos[:5] {
+		repo.MarkDelivered(id, 200, false)
+	}
+	n, err := repo.TrimReceipts(10, "teto de teste")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 15 {
+		t.Fatalf("deveria descartar os 15 pendentes mais antigos de A, descartou %d", n)
+	}
+	var sobraram []uint64
+	db.Model(&WebhookOutbox{}).Where("instance_id = ? AND lane = ? AND status = ?", "A", LaneReceipts, OutboxPending).
+		Order("id").Pluck("id", &sobraram)
+	if len(sobraram) != 10 || sobraram[0] != recibos[20] || sobraram[9] != recibos[29] {
+		t.Fatalf("deveriam sobrar os 10 recibos mais novos de A, sobraram %v", sobraram)
+	}
+	var descartado, entregue WebhookOutbox
+	db.First(&descartado, recibos[5])
+	if descartado.Status != OutboxDead || descartado.LastError != "teto de teste" {
+		t.Fatalf("o mais antigo pendente deveria virar dead com o motivo, ficou %s/%q", descartado.Status, descartado.LastError)
+	}
+	db.First(&entregue, recibos[0])
+	if entregue.Status != OutboxDelivered {
+		t.Fatalf("recibo já entregue não pode ser tocado, ficou %s", entregue.Status)
+	}
+	// B (below the cap), A's live message and A's Contact (sync) are untouched
+	var intactos int64
+	db.Model(&WebhookOutbox{}).Where("status = ? AND id IN ?", OutboxPending, []uint64{b1, msg}).Count(&intactos)
+	var contato int64
+	db.Model(&WebhookOutbox{}).Where("status = ? AND lane = ?", OutboxPending, LaneSync).Count(&contato)
+	if intactos != 2 || contato != 1 {
+		t.Fatalf("o teto só pode mexer nos recibos acima do teto (intactos=%d/2, sync=%d/1)", intactos, contato)
+	}
+	// under the cap, nothing changes
+	if n, _ := repo.TrimReceipts(10, "teto de teste"); n != 0 {
+		t.Fatalf("abaixo do teto não pode descartar nada, descartou %d", n)
+	}
+}

@@ -2,6 +2,7 @@ package webhook_producer
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -21,6 +22,13 @@ const (
 	// Faixa sync (app-state em massa): eventos pequenos, sem cadência; só não disputa com o ao vivo.
 	syncTick  = 2 * time.Second
 	syncBatch = 100
+	// Receipts lane (group/status receipts from other people): small events, same pace as sync, its own loop.
+	// Per instance at most receiptsMaxPending wait; the oldest beyond that are dropped (see TrimReceipts).
+	// At ~2 receipts/s per instance, 5,000 is ~40 min of backlog: older than that only fixes a count late.
+	receiptsTick       = 2 * time.Second
+	receiptsBatch      = 100
+	receiptsMaxPending = 5000
+	receiptsTrimEvery  = time.Minute
 	// Faixa bulk (HistorySync): UM chunk em voo por vez, somando TODOS os tenants. Um cliente grande
 	// pareando vira um fluxo contínuo e previsível pro CRM (e pro banco dele), em vez de uma rajada. Tick
 	// curto porque o gargalo é o tempo de ingestão de cada chunk, não o intervalo.
@@ -110,9 +118,10 @@ func StartOutboxWorker(
 // Run sobe um loop por faixa. Elas nunca disputam: o ao vivo segue com a latência de sempre enquanto o
 // bulk despeja histórico no ritmo que o CRM aguenta.
 func (w *OutboxWorker) Run(ctx context.Context) {
-	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s, rodízio %d/instância, %d instâncias em paralelo; sync: tick %s; histórico: 1 em voo, teto %d bytes/s)", outboxTick, perInstanceQuota, outboxParalelo, syncTick, w.bulkBytesPerSec)
+	w.logger.GetLogger("outbox").LogInfo("[outbox] worker iniciado (ao vivo: tick %s, rodízio %d/instância, %d instâncias em paralelo; sync: tick %s; recibos de grupo/status: tick %s, teto %d pendentes/instância; histórico: 1 em voo, teto %d bytes/s)", outboxTick, perInstanceQuota, outboxParalelo, syncTick, receiptsTick, receiptsMaxPending, w.bulkBytesPerSec)
 	go w.runLane(ctx, LaneBulk, bulkTick, bulkBatch, false)
 	go w.runLane(ctx, LaneSync, syncTick, syncBatch, false)
+	go w.runLane(ctx, LaneReceipts, receiptsTick, receiptsBatch, false)
 	w.runLane(ctx, LaneLive, outboxTick, outboxBatch, true)
 }
 
@@ -120,6 +129,7 @@ func (w *OutboxWorker) runLane(ctx context.Context, lane string, every time.Dura
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	lastCleanup := time.Now()
+	var lastTrim time.Time // zero: the first tick already trims (a restart may find a flood waiting)
 
 	for {
 		select {
@@ -127,6 +137,12 @@ func (w *OutboxWorker) runLane(ctx context.Context, lane string, every time.Dura
 			w.logger.GetLogger("outbox").LogInfo("[outbox] worker %s encerrado", lane)
 			return
 		case <-tick.C:
+			// The cap runs on the receipts lane's own loop, between two drains: it never races the delivery
+			// of the rows it may drop.
+			if lane == LaneReceipts && time.Since(lastTrim) >= receiptsTrimEvery {
+				w.trimReceipts()
+				lastTrim = time.Now()
+			}
 			w.drainOnce(ctx, lane, batch)
 			if doCleanup && time.Since(lastCleanup) >= cleanupEvery {
 				if n, err := w.repo.Cleanup(time.Now().Add(-keepDelivered), time.Now().Add(-keepDead)); err != nil {
@@ -137,6 +153,20 @@ func (w *OutboxWorker) runLane(ctx context.Context, lane string, every time.Dura
 				lastCleanup = time.Now()
 			}
 		}
+	}
+}
+
+// trimReceipts applies the per-instance cap of the receipts lane (see OutboxRepository.TrimReceipts). A
+// failure only means no cap this round: delivery goes on.
+func (w *OutboxWorker) trimReceipts() {
+	motivo := fmt.Sprintf("descartado: teto da faixa de recibos (mais de %d recibos de grupo/status pendentes na instância); só a contagem/tique de grupo no CRM fica sem ele", receiptsMaxPending)
+	n, err := w.repo.TrimReceipts(receiptsMaxPending, motivo)
+	if err != nil {
+		w.logger.GetLogger("outbox").LogWarn("[outbox] teto da faixa de recibos falhou: %v", err)
+		return
+	}
+	if n > 0 {
+		w.logger.GetLogger("outbox").LogWarn("[outbox] teto da faixa de recibos: %d recibos de grupo/status descartados (dead) — instância com mais de %d pendentes", n, receiptsMaxPending)
 	}
 }
 
@@ -155,8 +185,8 @@ func (w *OutboxWorker) drainOnce(ctx context.Context, lane string, batch int) {
 		return
 	}
 
-	// Ao vivo e sync: cada instância na sua goroutine (até outboxParalelo ao mesmo tempo), em ordem de id
-	// dentro dela. O ClaimDue já intercala as instâncias; aqui só se separa o que é de quem.
+	// Ao vivo, sync e recibos: cada instância na sua goroutine (até outboxParalelo ao mesmo tempo), em ordem
+	// de id dentro dela. O ClaimDue já intercala as instâncias; aqui só se separa o que é de quem.
 	ordem := make([]string, 0)
 	porInstancia := make(map[string][]WebhookOutbox)
 	for _, r := range rows {

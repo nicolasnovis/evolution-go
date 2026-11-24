@@ -63,8 +63,8 @@ func (r *OutboxRepository) HasOlderPending(instanceID string, beforeID uint64, l
 //
 // Bulk sai por id (FIFO global): dois clientes pareando ao mesmo tempo dividem a vazão por ordem de chegada.
 //
-// Ao vivo e sync saem em RODÍZIO entre instâncias: no máximo `perInstance` linhas de cada, intercaladas (a
-// 1ª de cada instância, depois a 2ª de cada…), sempre em ordem de id dentro da instância.
+// Ao vivo, sync e recibos saem em RODÍZIO entre instâncias: no máximo `perInstance` linhas de cada,
+// intercaladas (a 1ª de cada instância, depois a 2ª de cada…), sempre em ordem de id dentro da instância.
 // POR QUÊ (28/09): o claim era `ORDER BY instance_id, id LIMIT 200` — uma instância com milhares de
 // pendentes enchia o lote sozinha e todas as de instance_id MAIOR ficavam fora de todos os ciclos até ela
 // esvaziar (~20 min sem mensagem nos clientes "depois" dela).
@@ -131,6 +131,27 @@ func (r *OutboxRepository) MarkDead(id uint64, status int, errMsg string) error 
 		"last_status": status,
 		"last_error":  truncate(errMsg, 500),
 	}).Error
+}
+
+// TrimReceipts caps the receipts lane: for each instance it keeps the `keep` NEWEST pending rows and marks
+// the older ones dead, with `reason` in last_error. Returns how many rows it dropped.
+//
+// WHY (24/11): its own lane stops a receipt flood from holding live, not from growing. ~63k receipts at ~2/s
+// per instance is ~9h of draining, a claim that sorts the whole backlog on every tick and receipts hours
+// late that only feed a group tick / "N/M viewed" count. The newest are kept because they are the closest
+// to what people see now. The lane is fixed in the SQL on purpose: this can never touch live, sync or bulk.
+func (r *OutboxRepository) TrimReceipts(keep int, reason string) (int64, error) {
+	res := r.db.Exec(`
+		UPDATE webhook_outbox SET status = ?, last_error = ?
+		WHERE lane = ? AND status = ? AND id IN (
+			SELECT id FROM (
+				SELECT id, ROW_NUMBER() OVER (PARTITION BY instance_id ORDER BY id DESC) AS posicao
+				FROM webhook_outbox
+				WHERE lane = ? AND status = ?
+			) fila
+			WHERE posicao > ?
+		)`, OutboxDead, truncate(reason, 500), LaneReceipts, OutboxPending, LaneReceipts, OutboxPending, keep)
+	return res.RowsAffected, res.Error
 }
 
 // Cleanup apaga `delivered` antigos e `dead` bem antigos, pra a tabela não crescer sem limite.

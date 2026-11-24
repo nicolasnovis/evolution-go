@@ -134,9 +134,9 @@ func (p *webhookProducer) Produce(
 	}
 
 	// Webhook POR INSTÂNCIA → durável via outbox quando ligado; senão legado.
-	event, fromFullSync := eventMeta(payload)
-	if p.outbox != nil && durableEvent(event) {
-		p.enqueueAndTryImmediate(userID, event, laneFor(event, fromFullSync), payload, webhookUrl)
+	ev := eventMeta(payload)
+	if p.outbox != nil && durableEvent(ev.Event) {
+		p.enqueueAndTryImmediate(userID, ev.Event, laneFor(ev), payload, webhookUrl)
 	} else {
 		go p.sendWebhookWithRetry(webhookUrl, payload, 5, 30*time.Second, userID)
 	}
@@ -155,6 +155,7 @@ func (p *webhookProducer) enqueueAndTryImmediate(instanceID, event, lane string,
 	}
 	// Histórico (bulk) e app-state em massa (sync) NUNCA vão na hora: o worker da faixa entrega. Um despejo
 	// de milhares de eventos não pode virar milhares de POSTs (e de queries) simultâneos.
+	// Same for group/status receipts (receipts lane): one message to a big group brings thousands of them.
 	if lane != LaneLive {
 		return
 	}
@@ -229,21 +230,39 @@ func (p *webhookProducer) sendWebhookWithRetry(url string, body []byte, maxRetri
 
 // eventMeta lê do envelope JSON o campo "event" e, se houver, data.FromFullSync (app-state). O `data` vem
 // cru e é lido à parte: um data que não seja objeto não pode apagar o nome do evento.
-func eventMeta(payload []byte) (event string, fromFullSync bool) {
+//
+// data.Chat and data.Type (Receipt) are read raw as well and kept only when they are JSON strings: a field
+// of another type in some event must not make the whole data fail and wipe FromFullSync (that would send an
+// app-state flood back to the live lane).
+func eventMeta(payload []byte) eventInfo {
 	var env struct {
 		Event string          `json:"event"`
 		Data  json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(payload, &env); err != nil {
-		return "", false
+		return eventInfo{}
 	}
+	ev := eventInfo{Event: env.Event}
 	var data struct {
-		FromFullSync bool `json:"FromFullSync"`
+		FromFullSync bool            `json:"FromFullSync"`
+		Chat         json.RawMessage `json:"Chat"`
+		Type         json.RawMessage `json:"Type"`
 	}
 	if len(env.Data) > 0 && json.Unmarshal(env.Data, &data) == nil {
-		fromFullSync = data.FromFullSync
+		ev.FromFullSync = data.FromFullSync
+		ev.Chat = jsonString(data.Chat)
+		ev.ReceiptType = jsonString(data.Type)
 	}
-	return env.Event, fromFullSync
+	return ev
+}
+
+// jsonString returns raw as a Go string when it is a JSON string, "" otherwise (absent, null, object…).
+func jsonString(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return ""
+	}
+	return s
 }
 
 // CreateGlobalQueues não faz nada para webhook producer

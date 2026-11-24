@@ -1,6 +1,9 @@
 package webhook_producer
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Status de uma linha do outbox.
 const (
@@ -20,7 +23,18 @@ const (
 	LaneLive = "live" // mensagens, recibos, conexão… — latência importa
 	LaneBulk = "bulk" // HistorySync — volume alto, vazão cadenciada, nunca na frente do ao vivo
 	LaneSync = "sync" // app-state em massa (agenda, full sync) — volume alto, sem cadência, nunca na frente do ao vivo
+	// Receipts OTHER people send for my messages in a group or on my status: one per participant per message,
+	// no latency need, never ahead of live, capped per instance (see crowdReceipt and TrimReceipts).
+	LaneReceipts = "receipts"
 )
+
+// eventInfo is what the outbox reads from a webhook envelope to pick the lane (see eventMeta).
+type eventInfo struct {
+	Event        string // envelope "event"
+	FromFullSync bool   // data.FromFullSync (app-state)
+	Chat         string // data.Chat when it is a string (Receipt: the chat the receipt belongs to)
+	ReceiptType  string // data.Type when it is a string (Receipt: "" = delivered, "read", "played", "read-self"…)
+}
 
 // laneFor decide a faixa pelo tipo do evento e pela flag FromFullSync do app-state.
 //
@@ -29,14 +43,50 @@ const (
 // claim ordenado por instance_id, as instâncias "depois" dela ficaram ~20 min sem receber mensagem. Contact
 // só serve pro nome do contato no CRM (sem relação de ordem com Message), e um full sync de app-state
 // (arquivar/fixar/silenciar em massa, inclusive o que a nossa auto-cura dispara) tem o mesmo perfil.
-func laneFor(event string, fromFullSync bool) string {
+//
+// WHY the receipts lane (24/11): a client in 169 groups (~35k participants, the biggest with 1,234) sent a
+// message to dozens of them. Each participant answers with its own delivered AND read receipt, so ~63k
+// Receipt events piled up in that instance's live lane. Live order per instance is strict and the worker
+// delivers ~2 events/s per instance: 2,417 Message and 194 SendMessage waited behind them, 2h30 late and
+// growing. Those receipts only feed the group tick and the "N/M viewed" count in the CRM, so nothing about
+// them is worth holding a live message. Not sync: there they would hold Contact and app-state of the same
+// instance for hours instead.
+// Accepted trade-off: when live lags, a group receipt may now reach the CRM before the message it cites;
+// the CRM then ignores it (that participant is missing from the count / the tick may not go up). Cosmetic.
+func laneFor(ev eventInfo) string {
 	switch {
-	case event == "HistorySync":
+	case ev.Event == "HistorySync":
 		return LaneBulk
-	case event == "Contact", fromFullSync:
+	case ev.Event == "Contact", ev.FromFullSync:
 		return LaneSync
+	case crowdReceipt(ev):
+		return LaneReceipts
 	}
 	return LaneLive
+}
+
+// crowdReceipt says whether the event is a receipt that OTHER people send for my message in a group (@g.us)
+// or on my status (status@broadcast): delivered (""), read or played. A single message to a big group is
+// thousands of them.
+//
+// Everything else stays live, exactly as before:
+//   - 1:1 receipts (@lid, @s.whatsapp.net): few, and they drive the ✓✓ of the conversations;
+//   - read-self / played-self (I read or played it on my own phone), even in a group: the CRM uses them to
+//     clear the unread badge and to flag messages it is missing, so they must keep arriving AFTER the
+//     incoming Message they cite, which is in the live lane;
+//   - any other receipt type, newsletters and broadcast lists.
+func crowdReceipt(ev eventInfo) bool {
+	if ev.Event != "Receipt" {
+		return false
+	}
+	if !strings.HasSuffix(ev.Chat, "@g.us") && ev.Chat != "status@broadcast" {
+		return false
+	}
+	switch ev.ReceiptType {
+	case "", "read", "played":
+		return true
+	}
+	return false
 }
 
 // WebhookOutbox — fila write-ahead de eventos engine→webhook, no Postgres do PRÓPRIO engine (evogo_users).
